@@ -1,6 +1,6 @@
 {
   "name": "@greenhats/dsh-council",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Multi-model council deliberation for DeepSeek Harness",
   "license": "MIT",
   "repository": {
@@ -47,8 +47,6 @@
     "docs/release-readiness.md",
     "docs/chat-integration.md",
     "docs/context-integration-implementation-report.md",
-    "docs/assets/codebestie-banner.svg",
-    "docs/assets/codebestie-banner.zh.svg",
     "client.js",
     "locale/",
     "icon.svg"

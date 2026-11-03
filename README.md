@@ -70,7 +70,7 @@ Install [DeepSeek Harness (dsh)](https://www.deepseek.com/harness/) by following
 Install the prebuilt package from npm:
 
 ```sh
-npx --yes @deepseek-ai/dsh@latest plugin --profile web add @greenhats/dsh-council@0.1.3
+npx --yes @deepseek-ai/dsh@latest plugin --profile web add @greenhats/dsh-council@0.1.4
 npx --yes @deepseek-ai/dsh@latest web
 ```
 
@@ -84,7 +84,7 @@ Council requires fresh child context and explicit model/structured-output suppor
 
 ### Chat integration in 0.1.3
 
-Version 0.1.3 retains new sessions before model selection, records the real question, and renders a Council response in conversation order. Expand the execution panel to inspect participants' public reasoning/text; the final prose is separate from the collapsed audit. This uses the Desktop `0.2.1-rc.5` Client APIs; older clients retain a command-report fallback. The npm command above pins `0.1.3`; installing it does not restart the app or update other profiles automatically.
+Version 0.1.3 retains new sessions before model selection, records the real question, and renders a Council response in conversation order. Expand the execution panel to inspect participants' public reasoning/text; the final prose is separate from the collapsed audit. This uses the Desktop `0.2.1-rc.5` Client APIs; older clients retain a command-report fallback. The npm command above pins `0.1.4`; installing it does not restart the app or update other profiles automatically.
 
 After adding this Client half, fully quit and reopen Desktop DSH: refreshing the page alone does not invalidate the Host's cached package manifest. See [chat integration and acceptance checks](docs/chat-integration.md).
 
@@ -143,12 +143,6 @@ Enter this command in a DSH Web conversation:
 </td>
 </tr>
 </table>
-
-## Need more AI models?
-
-<a href="https://app.codebestie.org/register?aff=RA3Z7CMJW2SS">
-<img src="docs/assets/codebestie-banner.svg" width="100%" alt="CodeBestie — explore more model providers. Register with invitation code RA3Z7CMJW2SS.">
-</a>
 
 ## Configuration
 

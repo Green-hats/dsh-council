@@ -2,6 +2,16 @@
 
 This record preserves the historical 0.1.2 fork preparation and upstream release qualifications, and distinguishes deterministic regression checks from model-quality evaluation. The user subsequently reported publishing 0.1.2. The current 0.1.3 context-integration qualification is recorded below; see [chat integration and its verification boundary](chat-integration.md).
 
+## Release 0.1.4 — advertisement-free documentation and package
+
+Target: [@greenhats/dsh-council@0.1.4](https://www.npmjs.com/package/@greenhats/dsh-council/v/0.1.4), with source on the [Green-hats fork](https://github.com/Green-hats/dsh-council).
+
+- Remove third-party referral/banner sections from both READMEs, delete the two banner SVGs, and remove their package allowlist entries.
+- Pin installation examples to 0.1.4. No runtime behavior, SDK dependency, permission policy or model prompt changes are part of this patch.
+- Preserve the existing remote CI workflow and all unrelated local design materials. The 0.1.3 tag and registry tarball remain immutable.
+- Verify documentation links, the existing regression suite/build, and an 18-file tarball without advertising assets or referral text before publication; check the published latest version and downloaded SHA-512 afterwards.
+- The runtime qualification and real-device acceptance limits recorded under 0.1.3 still apply. This patch does not claim new real-model or visual acceptance.
+
 ## Release 0.1.3 — consented chat context integration
 
 Target: [@greenhats/dsh-council@0.1.3](https://www.npmjs.com/package/@greenhats/dsh-council/v/0.1.3), from the authorized [Green-hats fork](https://github.com/Green-hats/dsh-council). The original upstream remains separate. GitHub/npm publication is authorized; active-profile installation, app restart and real-provider calls are not part of it.
@@ -94,11 +104,11 @@ Release source: `5b6b87d0df0ab580b67ca1e00a48fa3a5e722e73`; [all CI jobs passed]
 
 ## Publish to npm
 
-The original 0.1.0 release above belongs to `@a1exsun/dsh-council`. The current release targets `@greenhats/dsh-council@0.1.3`; it does not update the original package. Authenticate as `greenhats` or an account explicitly granted publishing access to this package. After the checks above pass for the release:
+The original 0.1.0 release above belongs to `@a1exsun/dsh-council`. The current release targets `@greenhats/dsh-council@0.1.4`; it does not update the original package. Authenticate as `greenhats` or an account explicitly granted publishing access to this package. After the checks above pass for the release:
 
 ```sh
 npm login --registry=https://registry.npmjs.org/
-npm publish ./greenhats-dsh-council-0.1.3.tgz --access public --tag latest --registry=https://registry.npmjs.org/
+npm publish ./greenhats-dsh-council-0.1.4.tgz --access public --tag latest --registry=https://registry.npmjs.org/
 ```
 
 The `prepack` script builds `lib/` before packing or publishing. Registry installations use that prebuilt output and do not run a plugin build. `publishConfig` selects the public npm registry and public visibility. CI validates changes without publishing automatically.

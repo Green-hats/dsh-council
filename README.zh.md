@@ -70,7 +70,7 @@ https://github.com/user-attachments/assets/e81dfa36-5d93-4efb-8c67-015a5e4d2179
 从 npm 安装已编译的插件包：
 
 ```sh
-npx --yes @deepseek-ai/dsh@latest plugin --profile web add @greenhats/dsh-council@0.1.3
+npx --yes @deepseek-ai/dsh@latest plugin --profile web add @greenhats/dsh-council@0.1.4
 npx --yes @deepseek-ai/dsh@latest web
 ```
 
@@ -84,7 +84,7 @@ Council 要求子代理使用全新上下文，并明确支持模型选择和结
 
 ### 0.1.3 聊天集成
 
-0.1.3 会在选择模型前保留新会话，记录真实议题，并按聊天顺序显示议会回复。展开执行过程可查看各参与者返回的公开推理/正文；最终正文与默认收起的审计详情分开。增强 UI 使用桌面 `0.2.1-rc.5` 的 Client 接口，旧 Client 保留命令报告回退。上面的 npm 安装命令固定为 `0.1.3`；安装包不会自动重启或更新其他 profile。
+0.1.3 会在选择模型前保留新会话，记录真实议题，并按聊天顺序显示议会回复。展开执行过程可查看各参与者返回的公开推理/正文；最终正文与默认收起的审计详情分开。增强 UI 使用桌面 `0.2.1-rc.5` 的 Client 接口，旧 Client 保留命令报告回退。上面的 npm 安装命令固定为 `0.1.4`；安装包不会自动重启或更新其他 profile。
 
 新增 Client 部分后需要完整退出并重开桌面 DSH：只刷新页面不会清除 Host 的包元数据缓存。详见[聊天集成与验收说明](docs/chat-integration.md)。
 
@@ -143,12 +143,6 @@ Council 要求子代理使用全新上下文，并明确支持模型选择和结
 </td>
 </tr>
 </table>
-
-## 需要更多 AI 模型？
-
-<a href="https://app.codebestie.org/register?aff=RA3Z7CMJW2SS">
-<img src="docs/assets/codebestie-banner.zh.svg" width="100%" alt="CodeBestie — 探索更多模型服务。注册时请填写邀请码 RA3Z7CMJW2SS。">
-</a>
 
 ## 配置
 
