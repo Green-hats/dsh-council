@@ -70,13 +70,34 @@ https://github.com/user-attachments/assets/e81dfa36-5d93-4efb-8c67-015a5e4d2179
 从 npm 安装已编译的插件包：
 
 ```sh
-npx --yes @deepseek-ai/dsh@latest plugin --profile web add @a1exsun/dsh-council@0.1.0
+npx --yes @deepseek-ai/dsh@latest plugin --profile web add @greenhats/dsh-council@0.1.3
 npx --yes @deepseek-ai/dsh@latest web
 ```
 
 <blockquote><p>如果 DSH Web 已在运行，请重启。</p></blockquote>
 
 无需克隆源码或编译。开发环境设置请参阅[贡献指南](CONTRIBUTING.md)。
+
+桌面 DSH 请将 bundle 安装到桌面应用实际使用的 profile；独立 CLI 的 `web` profile 不一定与桌面共享。本版本兼容旧版 `start()` 和桌面 DSH `0.2.1-rc.5` 的 `startActivation()` 接口，验证结果见[发布准备记录](docs/release-readiness.md)。
+
+Council 要求子代理使用全新上下文，并明确支持模型选择和结构化输出。activation 接口仅允许受管理的本地 provider（默认 `spawn`），在首次提示前和冷恢复时重装角色及本轮持久工具策略（聊天背景模式禁止 Web，仅议题模式保留 Web）；若 preset 会覆盖 Council 角色则拒绝启动。仅评审人和裁决人在原始 activation 中获得 `structured_output`，Shell、文件及代理委派工具仍被阻止。
+
+### 0.1.3 聊天集成
+
+0.1.3 会在选择模型前保留新会话，记录真实议题，并按聊天顺序显示议会回复。展开执行过程可查看各参与者返回的公开推理/正文；最终正文与默认收起的审计详情分开。增强 UI 使用桌面 `0.2.1-rc.5` 的 Client 接口，旧 Client 保留命令报告回退。上面的 npm 安装命令固定为 `0.1.3`；安装包不会自动重启或更新其他 profile。
+
+新增 Client 部分后需要完整退出并重开桌面 DSH：只刷新页面不会清除 Host 的包元数据缓存。详见[聊天集成与验收说明](docs/chat-integration.md)。
+
+### 0.1.3 上下文融合 MVP
+
+默认先询问“使用当前聊天背景 / 仅议题 / 取消”。背景模式从精确 live 主会话和当前 Inbox 捕获一致原文；选择模型与材料后，原生确认页展示**完整公开材料和全部接收路由**。返回重选会使旧同意失效。助手建议保持“未验证”标签，工具证据默认不选，旧议会仅复用可可靠分离的精简结果，不对历史做模型摘要。
+
+- 背景模式禁用 Web、文件、Shell、再委派；附件仅显示 reference-only/excluded 名称，不读正文、不 OCR。
+- 任何材料/窗口超限都明确失败或让你选择仅议题，不静默裁剪。窗口必须来自模型元数据或你核实的 exact-key override，未知窗口不发起背景模型请求。旧 Host 缺捕获能力时明确选择仅议题/取消；缺权威 Inbox 时可明确同意仅已准入历史。
+- 回原聊天的只有 ModelReturn：答案、关键变化、共识/分歧、必要来源、匿名覆盖和限制。完整映射/排名/原始过程留在审计与独立子会话，不另唤醒主模型总结；下一次普通跟进即可准入。
+- 只持久化同意后的 packet；清空 pending 不会被重开记录补回。可以观察旧结果/冷恢复受限子会话，但不自动续跑崩溃中断的整轮议会。已发送到服务商或子会话的副本无法通过编辑原消息撤回。
+
+已完成本地工程和隔离 Host 验证；npm 发布不等于已安装到桌面 profile。原生完整预览、两轮真实对话和窄窗/主题仍需授权后的真机验收。实施证据见[施工报告](docs/context-integration-implementation-report.md)。
 
 ## 使用
 
@@ -94,7 +115,7 @@ npx --yes @deepseek-ai/dsh@latest web
 </td>
 <td width="65%" valign="top">
 <h3>输入议题</h3>
-<p>参与者使用全新上下文，请在议题中提供所需信息。</p>
+<p>参与者始终使用独立新会话。可先选择当前聊天背景、勾选原文并完整预览接收方；也可仅使用议题。</p>
 </td>
 </tr>
 </table>
@@ -110,11 +131,11 @@ npx --yes @deepseek-ai/dsh@latest web
 <tr>
 <td width="33%" valign="top">
 <p><strong>费用</strong></p>
-<p>每轮有 4–17 个模型参与者，每个参与者可能进行多次请求并使用 Web 工具。</p>
+<p>每轮有 4–17 个模型参与者，每个可能进行多次请求；只有仅议题模式可使用 Web。</p>
 </td>
 <td width="33%" valign="top">
 <p><strong>隐私</strong></p>
-<p>议题和中间回答会发送给所选模型服务。详见<a href="SECURITY.md">安全说明</a>。</p>
+<p>议题、经同意选择的聊天原文和中间产物会发送给所选模型服务；同意前不外发聊天正文。详见<a href="SECURITY.md">安全说明</a>。</p>
 </td>
 <td width="33%" valign="top">
 <p><strong>准确性</strong></p>
@@ -134,7 +155,7 @@ npx --yes @deepseek-ai/dsh@latest web
 <details>
 <summary><strong>默认配置与自定义限额</strong></summary>
 
-默认配置可直接使用。如需调整限额，在 DSH profile 的 `dsh-council` 条目中设置 `config`：
+默认提供背景模式选择；缺少可信窗口或捕获能力时必须显式改用仅议题。如需调整限额，在 DSH profile 的 `dsh-council` 条目中设置 `config`：
 
 ```yaml
 - id: dsh-council
@@ -145,9 +166,25 @@ npx --yes @deepseek-ai/dsh@latest web
     childTimeoutMs: 300000
     runTimeoutMs: 900000
     subagentProvider: spawn
+    contextMode: chat              # topic-only skips all history capture
+    contextCaptureAttempts: 3
+    contextCaptureTimeoutMs: 5000
+    contextPreparationTimeoutMs: 30000
+    contextMaxSources: 64
+    contextCandidateMaxBytes: 524288
+    contextPacketMaxBytes: 65536
+    contextMaxTokens: 4096
+    contextAnswerArtifactTokens: 2048
+    contextReviewArtifactTokens: 2048
+    contextArbiterOutputTokens: 4096
+    contextEnvelopeReserveTokens: 8192
+    contextSafetyMarginTokens: 2048
+    contextWindowOverrides: {}     # exact provider/model -> verified positive window
 ```
 
 Token 限额作用于单次模型请求。超时单位为毫秒，`runTimeoutMs` 不得小于 `childTimeoutMs`。
+
+背景模式生成上限取原阶段上限与产物预算的较小值；bytes 与启发式 token 估计分别检查。人工问答等待不计入准备/评议超时；真正请求会再检查系统提示、消息与工具 schema。TokenMeter 不是服务商精确 tokenizer。
 
 </details>
 

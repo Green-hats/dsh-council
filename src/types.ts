@@ -1,3 +1,5 @@
+import type { ArbiterDecision, ModelReturn, PacketRecord, StageMaterial } from './context-types.js'
+
 export interface ModelRef {
   readonly provider: string
   readonly providerName: string
@@ -51,6 +53,8 @@ export interface ArbiterOutput {
   readonly contradictions: readonly string[]
   readonly blindSpots: readonly string[]
   readonly confidenceNotes: string
+  readonly decisionDeltas?: ArbiterDecision['decisionDeltas']
+  readonly citations?: ArbiterDecision['citations']
 }
 
 export type CouncilStage = 'answer' | 'review' | 'arbiter'
@@ -89,4 +93,7 @@ export interface CouncilResult {
   readonly aggregateRanking: readonly AggregateRank[]
   readonly arbiter: ArbiterOutput
   readonly failures: readonly CallFailure[]
+  readonly packetRecord?: PacketRecord
+  readonly stageMaterials?: readonly StageMaterial[]
+  readonly modelReturn?: ModelReturn
 }

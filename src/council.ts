@@ -2,10 +2,26 @@ import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { CouncilCopy } from './locales.js'
 import { withDeadline } from './async.js'
 import {
+  assertArtifactBudget, assertStageMaterialBudget, normalizeContextConfig, planContextBudgets,
+  type ContextBudgetPlan, type ContextConfig, type ContextMaterialBinding,
+  type ContextStageBudget, type ContextTokenEstimator,
+} from './context-budget.js'
+import {
+  canonicalJson, createAnswerCorpus, createReviewCorpus, createStageMaterial,
+  normalizeProviderSet, serializePublicPacket, validatePacketRecord,
+} from './context-packet.js'
+import type { ArbiterDecision, PacketRecord, StageMaterial } from './context-types.js'
+import { createModelReturn, parseArbiterDecision } from './handoff.js'
+import {
   aggregateRankings,
   answerPrompt,
   arbiterPrompt,
   arbiterSchema,
+  chatArbiterSchema,
+  chatReviewerSchema,
+  chatStagePersona,
+  chatStagePrompt,
+  parseChatReviewerOutput,
   parseArbiterOutput,
   parseReviewerOutput,
   reviewPrompt,
@@ -24,7 +40,7 @@ import type {
   ReviewRecord,
 } from './types.js'
 
-export interface CouncilConfig {
+export interface CouncilConfig extends Partial<ContextConfig> {
   readonly answerMaxTokens: number
   readonly reviewMaxTokens: number
   readonly arbiterMaxTokens: number
@@ -48,6 +64,19 @@ export interface CouncilAnswer {
   readonly custom?: string
 }
 
+export interface ChatPreparation {
+  readonly packetRecord: PacketRecord
+  readonly budgets: ContextBudgetPlan
+  readonly estimator: ContextTokenEstimator
+}
+
+export interface ChildContext {
+  readonly packetRecord: PacketRecord
+  readonly material: ContextMaterialBinding
+  readonly budget: ContextStageBudget
+  readonly estimator: ContextTokenEstimator
+}
+
 export interface ChildRequest {
   readonly stage: CouncilStage
   readonly label: string
@@ -58,6 +87,7 @@ export interface ChildRequest {
   readonly outputSchema?: ObjectJsonSchema
   readonly timeoutMs: number
   readonly signal: AbortSignal
+  readonly context?: ChildContext
 }
 
 export interface ChildOutcome {
@@ -72,6 +102,11 @@ export interface CouncilRuntime {
   discover(signal: AbortSignal): Promise<ModelDirectory>
   ask(questions: readonly CouncilQuestion[], signal: AbortSignal): Promise<readonly CouncilAnswer[]>
   runChild(request: ChildRequest): Promise<ChildOutcome>
+  /** Host owns capture, selection, full preview and consent; no model calls here. */
+  prepare?(selection: CouncilSelection, signal: AbortSignal): Promise<ChatPreparation | undefined>
+  /** Persist each already-frozen stage exactly once before its children start. */
+  material?(material: StageMaterial): void
+  selected?(selection: CouncilSelection): void
   random(): number
 }
 
@@ -147,8 +182,8 @@ export function parseSelection(
   const arbiters = selectedModels(byId.get('arbiter'), byLabel, 1, 1, copy.arbiterRole, copy)
   const promptAnswer = byId.get('question')
   if ((promptAnswer?.selected.length ?? 0) > 0) throw new Error(copy.questionTextOnly)
-  const question = promptAnswer?.custom?.trim() ?? ''
-  if (question === '') throw new Error(copy.questionRequired)
+  const question = promptAnswer?.custom ?? ''
+  if (question.trim() === '') throw new Error(copy.questionRequired)
   return { answerers, reviewers, arbiter: arbiters[0] as ModelRef, question }
 }
 
@@ -203,6 +238,28 @@ function runChild(runtime: CouncilRuntime, request: ChildRequest, copy: CouncilC
     signal => runtime.runChild({ ...request, signal }))
 }
 
+function validatePreparation(prepared: ChatPreparation, selection: CouncilSelection, config: CouncilConfig): ChatPreparation {
+  const normalized = normalizeContextConfig(config)
+  if (normalized.contextMode === 'topic-only') throw new Error('Chat preparation is disabled by contextMode')
+  const packetRecord = validatePacketRecord(prepared.packetRecord)
+  if (packetRecord.packet.topicOriginal !== selection.question) throw new Error('Prepared topic differs from the selected original topic')
+  const routes = normalizeProviderSet([...selection.answerers, ...selection.reviewers, selection.arbiter]
+    .map(model => ({ provider: model.provider, model: model.model })))
+  if (canonicalJson(routes) !== canonicalJson(packetRecord.consent.providerSet)) throw new Error('Selected routes differ from consent')
+  const windows = new Map<string, number>()
+  for (const budget of prepared.budgets.requests) {
+    const previous = windows.get(budget.model.key)
+    if (previous !== undefined && previous !== budget.contextWindow) throw new Error('Inconsistent context windows for an exact model')
+    windows.set(budget.model.key, budget.contextWindow)
+  }
+  const budgets = planContextBudgets({
+    selection, config: normalized, windows, serializedPacket: serializePublicPacket(packetRecord.packet), estimator: prepared.estimator,
+    outputCaps: { answer: config.answerMaxTokens, review: config.reviewMaxTokens, arbiter: config.arbiterMaxTokens },
+  })
+  if (canonicalJson(budgets) !== canonicalJson(prepared.budgets)) throw new Error('Prepared budgets differ from the current exact selection and caps')
+  return Object.freeze({ packetRecord, budgets, estimator: prepared.estimator })
+}
+
 export async function runCouncil(
   runtime: CouncilRuntime,
   config: CouncilConfig,
@@ -219,10 +276,15 @@ export async function runCouncil(
     await runtime.ask(selectionQuestions(directory, copy), commandSignal),
     copy,
   )
+  commandSignal.throwIfAborted()
+  const preparation = await runtime.prepare?.(selection, commandSignal)
+  commandSignal.throwIfAborted()
+  const prepared = preparation === undefined ? undefined : validatePreparation(preparation, selection, config)
+  runtime.selected?.(selection)
   const failures: CallFailure[] = []
   try {
     return await withDeadline(commandSignal, config.runTimeoutMs, copy.runTimedOut,
-      signal => deliberate(runtime, config, directory, selection, failures, signal, copy))
+      signal => deliberate(runtime, config, directory, selection, failures, signal, copy, prepared))
   } catch (error: unknown) {
     commandSignal.throwIfAborted()
     if (error instanceof CouncilRunError) throw error
@@ -238,8 +300,38 @@ async function deliberate(
   failures: CallFailure[],
   runSignal: AbortSignal,
   copy: CouncilCopy,
+  prepared?: ChatPreparation,
 ): Promise<CouncilResult> {
   runSignal.throwIfAborted()
+  const contextConfig = normalizeContextConfig(config)
+  const stageMaterials: StageMaterial[] = []
+  const prepareStage = (material: StageMaterial, models: readonly ModelRef[]): ReadonlyMap<string, ChildContext> => {
+    if (prepared === undefined) throw new Error('Chat preparation is required')
+    if (material.packetHash !== prepared.packetRecord.packetHash) throw new Error('Stage packet identity changed')
+    const serializedPayload = canonicalJson(material.payload)
+    const binding = Object.freeze({ packetHash: material.packetHash, payloadHash: material.payloadHash, serializedPayload })
+    const contexts = new Map<string, ChildContext>()
+    // Every participant passes with the same actual payload before ANY starts.
+    for (const model of models) {
+      const budget = prepared.budgets.requests.find(row => row.stage === material.stage && row.model.key === model.key)
+      if (budget === undefined) throw new Error('Stage model has no approved budget')
+      assertStageMaterialBudget({ budget, serializedMaterial: serializedPayload, estimator: prepared.estimator })
+      contexts.set(model.key, Object.freeze({ packetRecord: prepared.packetRecord, material: binding, budget, estimator: prepared.estimator }))
+    }
+    runSignal.throwIfAborted()
+    runtime.material?.(material)
+    stageMaterials.push(material)
+    return contexts
+  }
+  const chatFields = (material: StageMaterial | undefined, contexts: ReadonlyMap<string, ChildContext> | undefined, model: ModelRef):
+    Partial<Pick<ChildRequest, 'context' | 'prompt' | 'persona' | 'maxTokens'>> => {
+    if (material === undefined) return {}
+    const context = contexts?.get(model.key)
+    if (context === undefined) throw new Error('Missing stage context binding')
+    return { context, prompt: chatStagePrompt(material, copy), persona: chatStagePersona(material.stage, copy), maxTokens: context.budget.maxOutputTokens }
+  }
+  const answerMaterial = prepared === undefined ? undefined : createStageMaterial({ stage: 'answer', payload: { packet: prepared.packetRecord.packet } })
+  const answerContexts = answerMaterial === undefined ? undefined : prepareStage(answerMaterial, selection.answerers)
 
   const answerRequests = selection.answerers.map((model, index): ChildRequest => ({
     stage: 'answer',
@@ -250,6 +342,7 @@ async function deliberate(
     maxTokens: config.answerMaxTokens,
     timeoutMs: config.childTimeoutMs,
     signal: runSignal,
+    ...chatFields(answerMaterial, answerContexts, model),
   }))
   const answerSettlements = await runStage(runtime, answerRequests, copy)
   runSignal.throwIfAborted()
@@ -262,7 +355,17 @@ async function deliberate(
         ...settlement.value,
         ...(settlement.value.stopReason === 'completed' ? { diagnostic: copy.emptyAnswer } : {}),
       }, copy))
-    } else successfulAnswers.push({ model, outcome: settlement.value })
+    } else {
+      try {
+        if (prepared !== undefined) assertArtifactBudget({
+          stage: 'answer', serializedArtifact: settlement.value.text, config: contextConfig,
+          estimator: prepared.estimator, model, maxOutputTokens: answerRequests[index]?.maxTokens ?? config.answerMaxTokens,
+        })
+        successfulAnswers.push({ model, outcome: settlement.value })
+      } catch (error: unknown) {
+        failures.push(thrownFailure('answer', model, error, copy))
+      }
+    }
   })
   if (successfulAnswers.length === 0) {
     throw new CouncilRunError(copy.noAnswers, directory.failures, failures)
@@ -271,10 +374,15 @@ async function deliberate(
   const answers: AnswerRecord[] = shuffle(successfulAnswers, () => runtime.random()).map((entry, index) => ({
     answerId: copy.answerId(index),
     model: entry.model,
-    text: entry.outcome.text.trim(),
+    text: prepared === undefined ? entry.outcome.text.trim() : entry.outcome.text,
     ...(entry.outcome.childId === undefined ? {} : { childId: entry.outcome.childId }),
   }))
   const answerIds = answers.map(answer => answer.answerId)
+  const answerCorpus = prepared === undefined ? undefined : createAnswerCorpus(answers)
+  const reviewMaterial = prepared === undefined || answerCorpus === undefined ? undefined : createStageMaterial({
+    stage: 'review', payload: { packet: prepared.packetRecord.packet, answerCorpus },
+  })
+  const reviewContexts = reviewMaterial === undefined ? undefined : prepareStage(reviewMaterial, selection.reviewers)
   const reviewRequests = selection.reviewers.map((model, index): ChildRequest => ({
     stage: 'review',
     label: copy.childReview(index, model.key),
@@ -282,9 +390,10 @@ async function deliberate(
     prompt: reviewPrompt(selection.question, answers, copy),
     persona: copy.reviewPersona,
     maxTokens: config.reviewMaxTokens,
-    outputSchema: reviewerSchema(answerIds),
+    outputSchema: prepared === undefined ? reviewerSchema(answerIds) : chatReviewerSchema(answerIds),
     timeoutMs: config.childTimeoutMs,
     signal: runSignal,
+    ...chatFields(reviewMaterial, reviewContexts, model),
   }))
   const reviewSettlements = await runStage(runtime, reviewRequests, copy)
   runSignal.throwIfAborted()
@@ -296,7 +405,7 @@ async function deliberate(
       return
     }
     const output = settlement.value.stopReason === 'completed'
-      ? parseReviewerOutput(settlement.value.structured, answerIds)
+      ? (prepared === undefined ? parseReviewerOutput(settlement.value.structured, answerIds) : parseChatReviewerOutput(settlement.value.structured, answerIds))
       : undefined
     if (output === undefined) {
       failures.push(childFailure('review', model, {
@@ -304,6 +413,15 @@ async function deliberate(
         ...(settlement.value.stopReason === 'completed' ? { diagnostic: copy.invalidReview } : {}),
       }, copy))
       return
+    }
+    if (prepared !== undefined) {
+      try {
+        assertArtifactBudget({ stage: 'review', serializedArtifact: canonicalJson(output), config: contextConfig,
+          estimator: prepared.estimator, model, maxOutputTokens: reviewRequests[index]?.maxTokens ?? config.reviewMaxTokens })
+      } catch (error: unknown) {
+        failures.push(thrownFailure('review', model, error, copy))
+        return
+      }
     }
     reviews.push({
       reviewId: copy.reviewId(index),
@@ -317,6 +435,10 @@ async function deliberate(
   }
 
   const aggregateRanking = aggregateRankings(reviews)
+  const arbiterMaterial = prepared === undefined || answerCorpus === undefined ? undefined : createStageMaterial({
+    stage: 'arbiter', payload: { packet: prepared.packetRecord.packet, answerCorpus, reviewCorpus: createReviewCorpus(reviews), aggregateRanking },
+  })
+  const arbiterContexts = arbiterMaterial === undefined ? undefined : prepareStage(arbiterMaterial, [selection.arbiter])
   const arbiterRequest: ChildRequest = {
     stage: 'arbiter',
     label: copy.childArbiter(selection.arbiter.key),
@@ -324,9 +446,10 @@ async function deliberate(
     prompt: arbiterPrompt(selection.question, answers, reviews, aggregateRanking, copy),
     persona: copy.arbiterPersona,
     maxTokens: config.arbiterMaxTokens,
-    outputSchema: arbiterSchema,
+    outputSchema: prepared === undefined ? arbiterSchema : chatArbiterSchema(prepared.packetRecord.packet.sources.map(source => source.alias)),
     timeoutMs: config.childTimeoutMs,
     signal: runSignal,
+    ...chatFields(arbiterMaterial, arbiterContexts, selection.arbiter),
   }
   let arbiterOutcome: ChildOutcome
   try {
@@ -336,9 +459,10 @@ async function deliberate(
     throw new CouncilRunError(copy.arbiterFailed, directory.failures, failures)
   }
   runSignal.throwIfAborted()
-  const arbiter: ArbiterOutput | undefined = arbiterOutcome.stopReason === 'completed'
-    ? parseArbiterOutput(arbiterOutcome.structured)
-    : undefined
+  const decision: ArbiterDecision | undefined = prepared !== undefined && arbiterOutcome.stopReason === 'completed'
+    ? parseArbiterDecision(arbiterOutcome.structured, prepared.packetRecord.packet.sources.map(source => source.alias)) : undefined
+  const arbiter: ArbiterOutput | undefined = prepared === undefined
+    ? (arbiterOutcome.stopReason === 'completed' ? parseArbiterOutput(arbiterOutcome.structured) : undefined) : decision
   if (arbiter === undefined) {
     failures.push(childFailure('arbiter', selection.arbiter, {
       ...arbiterOutcome,
@@ -347,6 +471,30 @@ async function deliberate(
     throw new CouncilRunError(copy.arbiterInvalid, directory.failures, failures)
   }
 
+  if (prepared !== undefined) {
+    try {
+      assertArtifactBudget({ stage: 'arbiter', serializedArtifact: canonicalJson(arbiter), config: contextConfig,
+        estimator: prepared.estimator, model: selection.arbiter, maxOutputTokens: arbiterRequest.maxTokens })
+    } catch (error: unknown) {
+      failures.push(thrownFailure('arbiter', selection.arbiter, error, copy))
+      throw new CouncilRunError(copy.arbiterInvalid, directory.failures, failures)
+    }
+  }
+  runSignal.throwIfAborted()
+  const modelReturn = prepared === undefined || decision === undefined ? undefined : createModelReturn({
+    runId: prepared.packetRecord.runId,
+    packetHash: prepared.packetRecord.packetHash,
+    decision,
+    sourceAliases: prepared.packetRecord.packet.sources.map(source => source.alias),
+    coverage: { answerersRequested: selection.answerers.length, answerersSucceeded: answers.length,
+      reviewersRequested: selection.reviewers.length, reviewersSucceeded: reviews.length },
+    limitations: [
+      copy.locale === 'zh' ? '本轮未联网，未读取文件或附件正文；来源引用仅为 reported，未独立核验。' : 'No Web access or file/attachment reading in this run. Citations are reported, not independently verified.',
+      ...(prepared.packetRecord.pendingPolicy === 'surface-only-user-approved' ? [copy.locale === 'zh' ? '用户同意仅使用已准入历史；当前待准入结果可能遗漏。' : 'User approved surface-only history; pending results may be missing.'] : []),
+      ...(prepared.packetRecord.packet.omissions.length > 0 ? [copy.locale === 'zh' ? `有 ${prepared.packetRecord.packet.omissions.length} 项材料省略说明，背景不代表全部历史。` : `${prepared.packetRecord.packet.omissions.length} material omission notices; background does not represent the entire history.`] : []),
+      ...(failures.length > 0 ? [copy.locale === 'zh' ? '部分参与者失败；以上覆盖人数按实际成功产物计算。' : 'Some participants failed; coverage counts only successful artifacts.'] : []),
+    ],
+  })
   return {
     selection,
     directoryFailures: directory.failures,
@@ -355,5 +503,7 @@ async function deliberate(
     aggregateRanking,
     arbiter,
     failures,
+    ...(prepared === undefined ? {} : { packetRecord: prepared.packetRecord, stageMaterials: Object.freeze(stageMaterials) }),
+    ...(modelReturn === undefined ? {} : { modelReturn }),
   }
 }

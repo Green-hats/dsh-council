@@ -2,7 +2,7 @@
 
 [English README](README.md) · [中文说明](README.zh.md)
 
-Use Node.js `^22.19.0 || >=24.0.0` and pnpm 11.7.0.
+Use Node.js `^22.19.0 || >=24.11.0` and pnpm 11.7.0 for development (the build toolchain requires Node 24.11+ on the 24.x line). The prebuilt plugin's runtime engine remains `^22.19.0 || >=24.0.0`.
 
 ```sh
 git clone https://github.com/a1exsun/dsh-council.git
@@ -35,6 +35,6 @@ Include DSH, Node.js, and plugin versions; operating system; locale; reproductio
 
 ## Updating DSH
 
-The development dependencies and lockfile record a tested SDK snapshot. `pnpm test:host` always tests against top-level `@deepseek-ai/dsh@latest`. Update SDK packages together to the host release and run all checks before committing the lockfile. Some DSH interface packages have a different `latest` tag from the host; resolve the host version first, then align its SDK family.
+The development dependencies and lockfile record a tested SDK snapshot. `pnpm test:host` defaults to top-level `@deepseek-ai/dsh@latest`; set `DSH_TEST_VERSION=0.1.2-rc.1` or `DSH_TEST_VERSION=0.2.1-rc.5` for the pinned compatibility jobs. CI runs all three. The legacy job pins its release-time Cordis vendor tuple because the old CLI's floating vendor dependencies now have an upstream HMR activation incompatibility. `DSH_TEST_KEEP_TEMP=1` retains the disposable runtime lockfile and report for diagnosis; no live profile is used. Immutable public npm downloads may use the shared cache, while npm configuration and credentials remain isolated. Update SDK packages together to the host release and run all checks before committing the lockfile. Some DSH interface packages have a different `latest` tag from the host; resolve the host version first, then align its SDK family.
 
 CI validates pull requests and pushes without publishing. See [release readiness](docs/release-readiness.md) before publishing.

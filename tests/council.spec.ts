@@ -11,6 +11,9 @@ import {
 } from '../src/council.js'
 import { localeCopies } from '../src/locales.js'
 import type { ModelDirectory, ModelRef } from '../src/types.js'
+import { normalizeContextConfig, planContextBudgets, type ContextTokenEstimator } from '../src/context-budget.js'
+import { compileContextPacket, createPacketRecord, hashText, serializePublicPacket } from '../src/context-packet.js'
+import type { StageMaterial } from '../src/context-types.js'
 
 const config: CouncilConfig = {
   answerMaxTokens: 16_384,
@@ -93,6 +96,35 @@ function successfulRuntime(overrides: Partial<CouncilRuntime> = {}) {
   return { runtime, calls }
 }
 
+function chatPreparation(selected: Parameters<NonNullable<CouncilRuntime['prepare']>>[0], estimator: ContextTokenEstimator) {
+  const source = 'User background: keep the exact code whitespace.'
+  const compiled = compileContextPacket({ topicOriginal: selected.question,
+    candidates: [{ source: { alias: 'S1', kind: 'user-text', text: source, epistemic: 'user-asserted' },
+      privateRef: { alias: 'S1', parentSessionId: 'parent', origin: 'surface', messageId: 'message', blockIndex: 0, textHash: hashText(source) } }],
+    selectedAliases: ['S1'] })
+  const packetRecord = createPacketRecord({ ...compiled, runId: 'run-chat', capturedThroughSeq: 1, pendingPolicy: 'included',
+    providerSet: [...selected.answerers, ...selected.reviewers, selected.arbiter].map(route => ({ provider: route.provider, model: route.model })) })
+  const budgets = planContextBudgets({ selection: selected, config: normalizeContextConfig(config),
+    windows: new Map(directory.models.map(route => [route.key, 100_000])), serializedPacket: serializePublicPacket(packetRecord.packet),
+    estimator, outputCaps: { answer: config.answerMaxTokens, review: config.reviewMaxTokens, arbiter: config.arbiterMaxTokens } })
+  return { packetRecord, budgets, estimator }
+}
+
+function chatRuntime(estimator: ContextTokenEstimator = { version: 'fixture', estimateMessage: () => 10 }) {
+  const base = successfulRuntime()
+  const material: StageMaterial[] = []
+  const original = base.runtime.runChild
+  base.runtime.prepare = async selected => chatPreparation(selected, estimator)
+  base.runtime.material = value => { material.push(value) }
+  base.runtime.runChild = async request => {
+    const outcome = await original(request)
+    return request.stage !== 'arbiter' ? outcome : { ...outcome, structured: { ...arbiter,
+      decisionDeltas: [{ sourceAliases: ['S1'], disposition: 'revised', text: 'Revise the earlier proposal.' }],
+      citations: [{ sourceAliases: ['S1'], verification: 'reported' }] } }
+  }
+  return { ...base, material }
+}
+
 describe('selection', () => {
   it('builds four questions and reports failed provider catalogs', () => {
     const questions = selectionQuestions({
@@ -121,6 +153,129 @@ describe('selection', () => {
     pickerAnswers.map(answer => answer.id === 'question' ? { ...answer, selected: ['unexpected'] } : answer),
   ])('rejects malformed or incomplete selections: %o', (...answers) => {
     expect(() => parseSelection(directory, answers as CouncilAnswer[], copy)).toThrow()
+  })
+})
+
+describe('chat three-stage material and budgets', () => {
+  it('freezes one packet and one shared anonymous corpus per stage (MAT-01)', async () => {
+    const { runtime, calls, material } = chatRuntime()
+    const result = await runCouncil(runtime, config, new AbortController().signal, copy)
+    expect(material.map(value => value.stage)).toEqual(['answer', 'review', 'arbiter'])
+    expect(new Set(material.map(value => value.packetHash)).size).toBe(1)
+    const reviewMaterial = material[1]
+    const arbiterMaterial = material[2]
+    if (reviewMaterial?.stage !== 'review' || arbiterMaterial?.stage !== 'arbiter') throw new Error('missing shared material')
+    expect(reviewMaterial.answerCorpusHash).toBe(arbiterMaterial.answerCorpusHash)
+    expect(reviewMaterial.payload.answerCorpus).toEqual(arbiterMaterial.payload.answerCorpus)
+    for (const stage of ['answer', 'review', 'arbiter']) {
+      const requests = calls.filter(request => request.stage === stage)
+      expect(new Set(requests.map(request => request.context?.material.payloadHash)).size).toBe(1)
+      expect(new Set(requests.map(request => request.prompt)).size).toBe(1)
+      for (const request of requests) {
+        expect(request.context?.packetRecord.packetHash).toBe(result.packetRecord?.packetHash)
+        expect(request.prompt).toContain(request.context?.material.serializedPayload)
+        expect(request.persona).toContain('Do not browse')
+        expect(request.maxTokens).toBe(stage === 'arbiter' ? 4_096 : 2_048)
+        expect(request.prompt).not.toContain('parent')
+        expect(request.prompt).not.toContain('p/a')
+        expect(request.prompt).not.toContain('p/b')
+        expect(request.prompt).not.toContain('p/c')
+      }
+    }
+    expect(Object.isFrozen(reviewMaterial.payload.answerCorpus)).toBe(true)
+    expect(result.modelReturn).toMatchObject({ runId: 'run-chat', packetHash: result.packetRecord?.packetHash,
+      coverage: { answerersRequested: 2, answerersSucceeded: 2, reviewersRequested: 2, reviewersSucceeded: 2 } })
+    expect(result.arbiter.decisionDeltas?.[0]?.disposition).toBe('revised')
+  })
+
+  it('records overlong participant artifacts as failures without truncating or leaking them onward', async () => {
+    const { runtime, material } = chatRuntime()
+    const oversized = '🧪'.repeat(20_000)
+    const seen: ChildRequest[] = []
+    runtime.runChild = async request => {
+      seen.push(request)
+      if (request.stage === 'answer') return { stopReason: 'completed', text: request.model.model === 'a' ? oversized : '  valid code\n    keep indentation\n' }
+      if (request.stage === 'review') return request.model.model === 'c'
+        ? { stopReason: 'completed', text: '', structured: review(['Answer A']) }
+        : { stopReason: 'error', text: '', diagnostic: 'review failed' }
+      return { stopReason: 'completed', text: '', structured: { ...arbiter, decisionDeltas: [], citations: [] } }
+    }
+    const result = await runCouncil(runtime, config, new AbortController().signal, copy)
+    expect(result.answers[0]?.text).toBe('  valid code\n    keep indentation\n')
+    expect(result.answers).toHaveLength(1)
+    expect(result.reviews).toHaveLength(1)
+    expect(result.failures).toHaveLength(2)
+    expect(result.failures[0]?.message).toContain('UTF-8 byte ceiling')
+    expect(result.modelReturn?.coverage).toEqual({ answerersRequested: 2, answerersSucceeded: 1, reviewersRequested: 2, reviewersSucceeded: 1 })
+    expect(material[1]?.payload).not.toEqual(expect.objectContaining({ text: oversized }))
+    expect(seen.filter(request => request.stage !== 'answer').every(request => !request.prompt.includes(oversized))).toBe(true)
+  })
+
+  it('rejects an otherwise valid over-token review as that reviewer failure, without passing partial JSON', async () => {
+    const estimator: ContextTokenEstimator = { version: 'fixture', estimateMessage: message => message.content.some(block =>
+      typeof block === 'object' && block !== null && 'text' in block && typeof block.text === 'string' && block.text.includes('TOKEN_OVERFLOW_SENTINEL')) ? 3_000 : 10 }
+    const { runtime, calls } = chatRuntime(estimator)
+    const run = runtime.runChild
+    runtime.runChild = async request => {
+      const outcome = await run(request)
+      return request.stage === 'review' && request.model.model === 'd'
+        ? { ...outcome, structured: { ...review(['Answer A', 'Answer B']), blindSpots: ['TOKEN_OVERFLOW_SENTINEL'] } } : outcome
+    }
+    const result = await runCouncil(runtime, config, new AbortController().signal, copy)
+    expect(result.reviews).toHaveLength(1)
+    expect(result.failures).toMatchObject([{ stage: 'review', message: expect.stringContaining('token ceiling') }])
+    expect(calls.at(-1)?.prompt).not.toContain('TOKEN_OVERFLOW_SENTINEL')
+  })
+
+  it('rechecks actual stage material for all participants before starting any reviewer', async () => {
+    const estimator: ContextTokenEstimator = { version: 'fixture', estimateMessage: message => message.content.some(block =>
+      typeof block === 'object' && block !== null && 'text' in block && typeof block.text === 'string' && block.text.includes('"answerCorpus"')) ? 100_000 : 10 }
+    const { runtime, calls, material } = chatRuntime(estimator)
+    await expect(runCouncil(runtime, config, new AbortController().signal, copy)).rejects.toThrow('actual review material')
+    expect(calls.map(request => request.stage)).toEqual(['answer', 'answer'])
+    expect(material.map(value => value.stage)).toEqual(['answer'])
+  })
+
+  it('requires the new strict arbiter fields and rejects Host-owned claims', async () => {
+    for (const structured of [arbiter, { ...arbiter, decisionDeltas: [], citations: [], coverage: { answerersSucceeded: 99 } },
+      { ...arbiter, decisionDeltas: [{ sourceAliases: ['S2'], disposition: 'supported', text: 'wrong alias' }], citations: [] }]) {
+      const { runtime } = chatRuntime()
+      const run = runtime.runChild
+      runtime.runChild = request => request.stage === 'arbiter' ? Promise.resolve({ stopReason: 'completed', text: '', structured }) : run(request)
+      await expect(runCouncil(runtime, config, new AbortController().signal, copy)).rejects.toThrow(copy.arbiterInvalid)
+    }
+  })
+
+  it('prepares after roster but before selected/model work, preserving original topic whitespace', async () => {
+    const { runtime, calls } = chatRuntime()
+    const events: string[] = []
+    const prepare = runtime.prepare
+    runtime.prepare = async (selected, signal) => {
+      events.push('prepare')
+      expect(calls).toHaveLength(0)
+      expect(selected.question).toBe('  What is the answer?\n')
+      return prepare?.(selected, signal)
+    }
+    runtime.selected = () => { events.push('selected') }
+    runtime.ask = async () => pickerAnswers.map(answer => answer.id === 'question' ? { ...answer, custom: '  What is the answer?\n' } : answer)
+    const result = await runCouncil(runtime, config, new AbortController().signal, copy)
+    expect(events).toEqual(['prepare', 'selected'])
+    expect(result.packetRecord?.packet.topicOriginal).toBe('  What is the answer?\n')
+  })
+
+  it('rejects stale consent/plan and cancellation before any child starts', async () => {
+    const { runtime, calls } = chatRuntime()
+    const estimator = { version: 'fixture', estimateMessage: () => 10 }
+    runtime.prepare = async selected => ({ ...chatPreparation(selected, estimator), packetRecord: chatPreparation({ ...selected, question: 'changed' }, estimator).packetRecord })
+    await expect(runCouncil(runtime, config, new AbortController().signal, copy)).rejects.toThrow('Prepared topic differs')
+    expect(calls).toHaveLength(0)
+    const controller = new AbortController()
+    runtime.prepare = async selected => {
+      controller.abort(new Error('cancelled while confirming'))
+      return chatPreparation(selected, estimator)
+    }
+    await expect(runCouncil(runtime, config, controller.signal, copy)).rejects.toThrow('cancelled while confirming')
+    expect(calls).toHaveLength(0)
   })
 })
 

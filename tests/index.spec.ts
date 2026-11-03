@@ -1,9 +1,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { CommandDefinition, CommandInvocation } from '@deepseek-ai/dsh-commands'
+import { SessionLogOffset, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
+import type { ProjectionDefinition, SessionProjectionStateMap } from '@deepseek-ai/dsh-session-projection'
 import type { SubagentRun, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apply, type Config } from '../src/index.js'
+import type { ActivationSpec } from '../src/subagents.js'
 
 const config: Config = {
   answerMaxTokens: 16_384,
@@ -12,6 +16,7 @@ const config: Config = {
   childTimeoutMs: 300_000,
   runTimeoutMs: 900_000,
   subagentProvider: 'spawn',
+  contextMode: 'topic-only',
 }
 
 const pickerAnswers = {
@@ -49,34 +54,102 @@ type PreStepListener = (
   next: () => Promise<{ kind: 'enter'; messages: Array<{ id?: string }> }>,
 ) => Promise<{ kind: string; messages?: Array<{ id?: string }> }>
 type SettingsListener = (namespace: string) => void
+interface TestProvider {
+  inheritsParentContext?: boolean
+  capabilities: { agentOptions?: boolean; outputSchema?: boolean; depthLimit?: boolean; toolFilter?: boolean; persona?: boolean; agentPreset?: boolean }
+  prepareContinuable?: () => Promise<object>
+}
 type TestAgent = Agent & {
-  readonly recordedEvents: Array<{ type: string }>
+  readonly recordedEvents: Array<{ type: string; data?: Record<string, unknown> }>
   session: Agent['session'] & { blank: boolean }
 }
 
+const persistedParents = new Map<string, Agent>()
+afterEach(() => { persistedParents.clear() })
+
 function harness(
   ask = async () => pickerAnswers,
-  provider: { capabilities: { agentOptions: boolean; outputSchema: boolean; depthLimit: boolean; toolFilter: boolean; persona: boolean } } | null = {
+  provider: TestProvider | null = {
+    inheritsParentContext: false,
     capabilities: { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
+    prepareContinuable: () => Promise.resolve({}),
   },
   initialLocale: 'en' | 'zh' = 'en',
   configuration = config,
+  settingsApi: 'legacy' | 'config-editor' = 'legacy',
 ) {
   let command: CommandDefinition | undefined
   let preStep: PreStepListener | undefined
   let settingsUpdated: SettingsListener | undefined
-  let agentCreated: ((payload: { agent: Agent }) => void) | undefined
+  let settingsDocumentUpdated: SettingsListener | undefined
+  let agentCreated: ((payload: { agent: Agent }) => void | Promise<void>) | undefined
   const guards: Array<(execution: { name: string }) => string | undefined> = []
   const assemblies: Array<(assembly: unknown, context: unknown, next: () => Promise<{ tools: Array<{ name: string }> }>) => Promise<{ tools: Array<{ name: string }> }>> = []
   let locale = initialLocale
   const childRequests: SubagentStartRequest[] = []
+  const activationSpecs: ActivationSpec[] = []
+  const restrictions: Array<{ allow: readonly string[] }> = []
+  const personas: Array<{ name: string; order: number; text: string; interpolate: boolean }> = []
   const disposed: string[] = []
   const renamed: string[] = []
   const cleanups: Array<() => unknown> = []
+  const projections = new Map<string, (session: { header: SessionHeader; events?: SessionEvent[]; recordedEvents?: SessionEvent[] }) => unknown>()
+  const children: Agent[] = []
+  const policyDisposals: string[] = []
+  const childReleases = new Map<Agent, () => Promise<void>>()
+  let completePrompt = false
+  function childAgent(id: string, parentId: string, events: SessionEvent[] = []): Agent {
+    let personaSection: typeof personas[number] | undefined
+    const child = {
+      id,
+      options: (() => {
+        const policy = events.flatMap(event => event.type === 'agent/inbox/spliced' ? event.data.inserted : []).map(message => message.source.kind === 'dsh-council' ? message.source.childPolicy : undefined).find(value => value?.version === 2)
+        return policy?.version === 2 ? { provider: policy.approvedRoute.provider, model: policy.approvedRoute.model } : {}
+      })(),
+      session: { id, header: { id, parentSession: parentId }, events },
+      cancel() {},
+      whenIdle: () => Promise.resolve(),
+      inject(message: unknown) {
+        events.push({ type: 'agent/inbox/spliced', seq: events.length, time: 0,
+          data: { target: 'next-step', start: 0, inserted: [message] } } as SessionEvent)
+      },
+      ctx: {
+        effect(factory: () => Generator<() => unknown, void, unknown>, label?: string) {
+          const releases = [...factory()]
+          let disposed = false
+          const dispose = async () => {
+            if (disposed) return
+            disposed = true
+            for (const release of releases.reverse()) await release()
+            if (label === 'dsh-council child policy') policyDisposals.push(id)
+          }
+          const earlier = childReleases.get(child)
+          childReleases.set(child, earlier === undefined ? dispose : async () => { await dispose(); await earlier() })
+          return dispose
+        },
+        tools: {
+          presentAs(mode: string) { expect(mode).toBe('native'); return () => {} },
+          guard(callback: typeof guards[number]) { guards.push(callback); return () => { const index = guards.indexOf(callback); if (index >= 0) guards.splice(index, 1) } },
+          restrict(filter: typeof restrictions[number]) { restrictions.push(filter); return () => {} },
+        },
+        systemPrompt: {
+          getSectionOrder: () => 50,
+          section(section: typeof personas[number]) { personaSection = section; personas.push(section); return () => {} },
+          async assemble() { return { sections: completePrompt ? [] : [personaSection].filter(Boolean) } },
+        },
+        on(event: string, listener: typeof assemblies[number]) { if (event === 'system-prompt/assemble') assemblies.push(listener); return () => {} },
+      },
+    } as unknown as Agent
+    children.push(child)
+    return child
+  }
   const ctx = {
     commands: {
       register(definition: CommandDefinition) {
-        command = definition
+        command = { ...definition, handler(invocation) {
+          persistedParents.set(String(invocation.agent.id), invocation.agent)
+          return definition.handler(invocation)
+        } }
         return () => {}
       },
     },
@@ -92,8 +165,20 @@ function harness(
     sessionTitle: {
       rename(_session: unknown, title: string) { renamed.push(title) },
     },
-    settings: { get: () => ({ preference: locale }) },
+    settings: settingsApi === 'legacy' ? { get: () => ({ preference: locale }) } : {},
+    get(name: string) {
+      if (name === 'agents') return { get: (id: string) => children.find(child => String(child.id) === id) ?? persistedParents.get(id), roots: () => [...persistedParents.values()] }
+      if (name !== 'configEditor') return undefined
+      return { configuration: () => [{ entry: { options: { id: 'locale' }, fiber: { config: { preference: { get: () => locale } } } } }] }
+    },
     sessionProjections: {
+      register<K extends keyof SessionProjectionStateMap>(definition: ProjectionDefinition<K>) {
+        projections.set(definition.key, session => (session.events ?? session.recordedEvents ?? []).reduce(definition.apply, definition.init(session.header, SessionLogOffset(0))))
+        return () => { projections.delete(definition.key) }
+      },
+      stateOf(session: { header: SessionHeader; events?: SessionEvent[]; recordedEvents?: SessionEvent[] }, key: string) {
+        return projections.get(key)?.(session)
+      },
       snapshot: (session: { blank: boolean }) => ({
         asOfSeq: -1,
         values: { sessionListMetadata: { blank: session.blank, lastPromptAt: null } },
@@ -113,18 +198,18 @@ function harness(
             }
           : properties?.answerMarkdown === undefined ? undefined : arbiter
         const id = `child-${childRequests.length}`
-        const child = {
-          id,
-          session: { header: { parentSession: request.parent.id } },
-          ctx: {
-            tools: {
-              presentAs(mode: string) { expect(mode).toBe('native') },
-              guard(callback: typeof guards[number]) { guards.push(callback) },
-            },
-            on(_event: string, listener: typeof assemblies[number]) { assemblies.push(listener) },
-          },
-        } as unknown as Agent
-        agentCreated?.({ agent: child })
+        const child = childAgent(id, String(request.parent.id))
+        Object.assign(child.options, request.agentOptions)
+        try {
+          await agentCreated?.({ agent: child })
+        } catch (error) {
+          // The real serial Agent factory rolls back failed unpublished setup.
+          // A late canceled start now fails manifest binding before any prompt;
+          // its exact scope still has to unwind before startup can settle.
+          await childReleases.get(child)?.()
+          disposed.push(id)
+          throw error
+        }
         return {
           id: id as SubagentRun['id'],
           localAgent: undefined,
@@ -141,9 +226,11 @@ function harness(
       if (event === 'agent/created') agentCreated = listener as typeof agentCreated
       if (event === 'agent/pre-step') preStep = listener as PreStepListener
       if (event === 'settings/updated') settingsUpdated = listener as SettingsListener
+      if (event === 'settings/document-updated') settingsDocumentUpdated = listener as SettingsListener
       return () => {
         if (event === 'agent/pre-step') preStep = undefined
         if (event === 'settings/updated') settingsUpdated = undefined
+        if (event === 'settings/document-updated') settingsDocumentUpdated = undefined
       }
     },
     effect(factory: () => Generator<unknown, void, unknown>) {
@@ -157,9 +244,31 @@ function harness(
   apply(ctx, configuration)
   return {
     ctx,
-    async dispose() { await Promise.all(cleanups.reverse().map(cleanup => cleanup())) },
+    async dispose() { for (const cleanup of cleanups.reverse()) await cleanup() },
     command: () => command,
     childRequests,
+    children,
+    policyDisposals,
+    childAgent,
+    disposeChildPolicy(agent: Agent) { return childReleases.get(agent)?.() },
+    suppressPersona() { completePrompt = true },
+    emitCreated(agent: Agent) { return agentCreated?.({ agent }) },
+    activationSpecs,
+    restrictions,
+    personas,
+    useActivations() {
+      const runtime = ctx.subagents as unknown as {
+        start?: (provider: string, request: SubagentStartRequest) => Promise<SubagentRun>
+        startActivation?: (spec: ActivationSpec) => Promise<{ childId: SubagentRun['id']; result: SubagentRun['result']; dispose(): Promise<void> }>
+      }
+      const start = runtime.start!
+      delete runtime.start
+      runtime.startActivation = async spec => {
+        activationSpecs.push(spec)
+        const run = await start(spec.provider, { ...spec.request, label: spec.label, signal: spec.signal })
+        return { childId: run.id, result: run.result, dispose: () => run.dispose() }
+      }
+    },
     guards,
     assemblies,
     disposed,
@@ -167,17 +276,33 @@ function harness(
     preStep: () => preStep,
     setLocale(next: 'en' | 'zh') {
       locale = next
-      settingsUpdated?.('locale')
+      if (settingsApi === 'legacy') settingsUpdated?.('locale')
+      else settingsDocumentUpdated?.('locale')
     },
   }
 }
 
 function agentWithHistory(blank = false, listener?: () => PreStepListener | undefined): TestAgent {
-  const events: Array<{ type: string }> = blank ? [] : [{ type: 'turn/start' }]
+  const events: Array<{ type: string; data?: Record<string, unknown> }> = blank ? [] : [{ type: 'turn/start' }]
   let idle = Promise.resolve()
   const agent = {
     id: blank ? 'blank-root' : 'root',
-    session: { blank },
+    session: {
+      id: blank ? 'blank-root' : 'root',
+      header: { id: blank ? 'blank-root' : 'root', version: 3, createdAt: 0, isSeeded: false },
+      events,
+      blank,
+      get seq() { return events.length },
+      eventAt(seq: number) { return events[seq] },
+      append(type: string, data: Record<string, unknown>) {
+        const event = { type, data: structuredClone(data), seq: events.length, time: Date.now() }
+        events.push(event)
+        return event
+      },
+    },
+    inject(message: unknown) {
+      agent.session.append('agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [message] })
+    },
     recordedEvents: events,
     ctx: {},
     followup(message: unknown) {
@@ -187,7 +312,7 @@ function agentWithHistory(blank = false, listener?: () => PreStepListener | unde
         { agent: agent as unknown as Agent, messages: [message as { id?: string }] },
         () => Promise.resolve({ kind: 'enter', messages: [message as { id?: string }] }),
       )).then((decision) => {
-        if (decision?.kind !== 'enter' || decision.messages?.length !== 0) {
+        if (decision?.kind !== 'reject' && (decision?.kind !== 'enter' || decision.messages?.length !== 0)) {
           throw new Error('blank-session pre-step was not consumed')
         }
         events.push({ type: 'turn/end' })
@@ -199,7 +324,7 @@ function agentWithHistory(blank = false, listener?: () => PreStepListener | unde
 }
 
 const existingAgent = agentWithHistory()
-const invocation = (rawInput = '', agent: Agent = existingAgent) => ({
+const invocation = (rawInput = '', agent: Agent = agentWithHistory()) => ({
   commandId: 'command-1',
   agent,
   rawInput,
@@ -228,6 +353,40 @@ describe('DSH command integration', () => {
     expect(test.disposed).toHaveLength(4)
   })
 
+  it('runs DSH 0.2 activations with local roles, Web-only policy, and exact child disposal', async () => {
+    const test = harness(undefined, {
+      inheritsParentContext: false,
+      capabilities: { agentOptions: true, outputSchema: true, depthLimit: true, agentPreset: true },
+      prepareContinuable: () => Promise.resolve({}),
+    }, 'zh', config, 'config-editor')
+    test.useActivations()
+    const result = await test.command()!.handler(invocation())
+    expect(result).toMatchObject({ kind: 'success' })
+    expect(result.text).toContain('Final answer')
+    expect(result.text).toContain('# 议会裁决')
+    expect(test.command()?.description).toBe('运行匿名多模型议会')
+    expect(test.activationSpecs).toHaveLength(4)
+    for (const spec of test.activationSpecs) {
+      expect(spec).toMatchObject({ provider: 'spawn', delivery: 'caller' })
+      expect(spec.request).not.toHaveProperty('persona')
+      expect(spec.request).not.toHaveProperty('toolFilter')
+      expect(spec.request).not.toHaveProperty('signal')
+      expect(spec.request).not.toHaveProperty('label')
+    }
+    expect(test.activationSpecs.map(spec => spec.request.agentOptions?.model)).toEqual(['a', 'b', 'c', 'a'])
+    expect(test.restrictions).toEqual(Array.from({ length: 4 }, () => ({ allow: ['web_search', 'web_fetch'] })))
+    expect(test.personas).toHaveLength(4)
+    expect(test.personas.every(section => section.name === 'deployment:persona-prefix' && section.text.length > 0 && section.interpolate === false)).toBe(true)
+    expect(new Set(test.personas.map(section => section.text)).size).toBe(3)
+    expect(test.guards).toHaveLength(4)
+    expect(test.guards.every(guard => guard({ name: 'shell' }) !== undefined)).toBe(true)
+    expect(test.guards[0]!({ name: 'structured_output' })).toBeDefined()
+    expect(test.guards[2]!({ name: 'structured_output' })).toBeUndefined()
+    expect(test.disposed).toEqual(['child-1', 'child-2', 'child-3', 'child-4'])
+    test.setLocale('en')
+    expect(test.command()?.description).toBe('Run an anonymous multi-model council')
+  })
+
   it('rejects arguments and overlapping runs in the same session', async () => {
     let release: ((value: typeof pickerAnswers) => void) | undefined
     const waiting = new Promise<typeof pickerAnswers>(resolve => { release = resolve })
@@ -235,7 +394,7 @@ describe('DSH command integration', () => {
     const command = test.command()
     await expect(command?.handler(invocation(' unexpected'))).resolves.toMatchObject({ kind: 'error' })
     const first = command?.handler(invocation())
-    await expect(command?.handler(invocation())).resolves.toEqual({
+    await expect(command?.handler(invocation())).resolves.toMatchObject({
       kind: 'error',
       text: 'A Council run is already active in this session.',
     })
@@ -263,7 +422,7 @@ describe('DSH command integration', () => {
 
   it('registers during boot and reports a missing runtime provider only when invoked', async () => {
     const test = harness(async () => pickerAnswers, null)
-    await expect(test.command()?.handler(invocation())).resolves.toEqual({
+    await expect(test.command()?.handler(invocation())).resolves.toMatchObject({
       kind: 'error',
       text: 'Council failed: subagent provider "spawn" is not registered',
     })
@@ -272,8 +431,10 @@ describe('DSH command integration', () => {
   it('retains a command started on a blank session without making another model call', async () => {
     const test = harness()
     const blankAgent = agentWithHistory(true, test.preStep)
+    const followup = vi.spyOn(blankAgent, 'followup')
     const result = await test.command()?.handler(invocation('', blankAgent))
     expect(result).toMatchObject({ kind: 'success' })
+    expect(followup).toHaveBeenCalledWith(expect.objectContaining({ source: { kind: 'dsh-council' }, content: [] }))
     expect(test.renamed).toEqual(['Council'])
     expect(blankAgent.recordedEvents.some(event => event.type === 'turn/start')).toBe(true)
     expect(blankAgent.recordedEvents.some(event => event.type === 'step/start')).toBe(false)
@@ -300,7 +461,7 @@ describe('DSH command integration', () => {
   ])('localizes DSH question cancellation in %s', async (locale, expected) => {
     const cancelled = Object.assign(new Error('the user cancelled ask_user_question'), { code: 'ASK_CANCELLED' })
     const test = harness(async () => Promise.reject(cancelled), undefined, locale)
-    await expect(test.command()?.handler(invocation())).resolves.toEqual({ kind: 'error', text: expected })
+    await expect(test.command()?.handler(invocation())).resolves.toMatchObject({ kind: 'error', text: expected })
   })
 
   it('does not clear a user message batched with the blank-session marker', async () => {
@@ -317,15 +478,49 @@ describe('DSH command integration', () => {
     expect(await test.command()?.handler(invocation('', mixedAgent))).toMatchObject({ kind: 'success' })
   })
 
-  it('does not rename or create an extra turn when the user activates the session during a run', async () => {
-    const blankAgent = agentWithHistory(true)
+  it('promotes a new session before the model picker and starts no parent model step', async () => {
+    let blankAgent: TestAgent
     const test = harness(async () => {
-      blankAgent.session.blank = false
+      expect(blankAgent.session.blank).toBe(false)
+      expect(blankAgent.recordedEvents.filter(event => event.type === 'turn/start')).toHaveLength(1)
       return pickerAnswers
     })
-    expect(await test.command()?.handler(invocation('', blankAgent))).toMatchObject({ kind: 'success' })
-    expect(test.renamed).toEqual([])
-    expect(blankAgent.recordedEvents).toEqual([])
+    blankAgent = agentWithHistory(true, test.preStep)
+    const result = await test.command()!.handler(invocation('', blankAgent))
+    expect(result).toMatchObject({ kind: 'success' })
+    expect(test.renamed).toEqual(['Council'])
+    expect(blankAgent.recordedEvents.filter(event => event.type === 'step/start')).toHaveLength(0)
+    const pending = blankAgent.recordedEvents.filter(event => event.type === 'agent/inbox/spliced')
+      .flatMap(event => event.data?.inserted as ReturnType<typeof createUserMessage>[])
+    const questions = pending.filter(message => message.source.kind === 'dsh-council' && message.source.question !== undefined)
+    const results = pending.filter(message => message.source.kind === 'dsh-council' && message.source.result !== undefined)
+    expect(questions).toHaveLength(1)
+    expect(results).toHaveLength(1)
+    expect(questions[0]).toMatchObject({ source: { kind: 'dsh-council', question: { commandId: 'command-1', text: 'Question' } }, content: [{ type: 'text', text: 'Question' }] })
+    expect(results[0]).toMatchObject({ source: { kind: 'dsh-council', result: { version: 2, commandId: 'command-1', status: 'success', modelReturn: { answerMarkdown: 'Final answer' }, presentation: { answerMarkdown: 'Final answer' } } } })
+    expect(pending.indexOf(questions[0]!)).toBeLessThan(pending.indexOf(results[0]!))
+    expect(results[0]!.content).not.toEqual(expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining('p/a') })]))
+    expect(blankAgent.recordedEvents.filter(event => event.type === 'user/message')).toHaveLength(0)
+    expect(result).toHaveProperty('sourceEventSeq')
+  })
+
+  it('removes UI-only markers without dropping real user input, result context, or request-series flags', async () => {
+    const test = harness()
+    const marker = createUserMessage({ content: [], source: { kind: 'dsh-council', ui: {
+      version: 1, commandId: 'ui-admission', status: 'running', question: 'Q', participants: [],
+    } } })
+    const ordinary = createUserMessage({ content: [{ type: 'text', text: 'Continue this conversation.' }], source: { kind: 'user' } })
+    const result = createUserMessage({ content: [{ type: 'text', text: 'Final Council context' }], source: {
+      kind: 'dsh-council', result: { version: 1, commandId: 'ui-admission', status: 'success' },
+    } })
+    const messages = [marker, ordinary, result]
+    const decision = await test.preStep()!({ agent: existingAgent, messages }, async () => ({
+      kind: 'enter', messages, startsRequestSeries: true,
+    }))
+    expect(decision).toMatchObject({ kind: 'enter', messages: [ordinary, result], startsRequestSeries: true })
+    const injectSynthetic = vi.fn(async () => ({ kind: 'enter' as const, messages: [ordinary] }))
+    expect(await test.preStep()!({ agent: existingAgent, messages: [marker] }, injectSynthetic)).toEqual({ kind: 'reject' })
+    expect(injectSynthetic).not.toHaveBeenCalled()
   })
 
   it('does not let prompt injectors turn marker-only retention into a model completion', async () => {
@@ -335,6 +530,20 @@ describe('DSH command integration', () => {
     expect(await test.command()!.handler(invocation('', blankAgent))).toMatchObject({ kind: 'success' })
     expect(injectPrompt).not.toHaveBeenCalled()
     expect(test.childRequests).toHaveLength(4)
+  })
+
+  it('vetoes marker-only retention even when outer preset listeners inject context', async () => {
+    const test = harness()
+    const injected = { id: 'time-or-skills-context' }
+    const blankAgent = agentWithHistory(true, () => async (payload, next) => {
+      const decision = await test.preStep()!(payload, next)
+      if (decision.kind === 'reject') return decision
+      return { ...decision, messages: [...(decision.messages ?? []), injected] }
+    })
+    expect(await test.command()!.handler(invocation('', blankAgent))).toMatchObject({ kind: 'success' })
+    expect(test.renamed).toEqual(['Council'])
+    expect(test.childRequests).toHaveLength(4)
+    expect(blankAgent.recordedEvents.filter(event => event.type.startsWith('turn/'))).toEqual([{ type: 'turn/start' }, { type: 'turn/end' }])
   })
 
   it('keeps the final answer when retaining the session fails', async () => {
@@ -349,7 +558,7 @@ describe('DSH command integration', () => {
   it('returns a localized command error when the projection is missing', async () => {
     const test = harness(undefined, undefined, 'zh')
     test.ctx.sessionProjections.snapshot = () => ({ asOfSeq: -1, values: {} })
-    expect(await test.command()?.handler(invocation())).toEqual({
+    expect(await test.command()?.handler(invocation())).toMatchObject({
       kind: 'error', text: '议会失败：DSH 会话元数据不可用。',
     })
     expect(test.childRequests).toHaveLength(0)
@@ -375,12 +584,12 @@ describe('DSH command integration', () => {
     const controller = new AbortController()
     const pending = test.command()!.handler({ ...invocation(), signal: controller.signal })
     controller.abort()
-    expect(await pending).toEqual({ kind: 'error', text: 'Council was canceled.' })
+    expect(await pending).toMatchObject({ kind: 'error', text: 'Council was canceled.' })
     test.ctx.llm.listModels = listModels
     expect(await test.command()!.handler(invocation())).toMatchObject({ kind: 'success' })
   })
 
-  it('disposes a child whose result never settles when the command is cancelled', async () => {
+  it.each(['legacy', 'activation'] as const)('disposes a %s child whose result never settles when cancelled', async (api) => {
     const test = harness()
     const controller = new AbortController()
     const disposed: string[] = []
@@ -391,6 +600,7 @@ describe('DSH command integration', () => {
       async dispose() { disposed.push('done') },
     })
     const started = vi.spyOn(test.ctx.subagents, 'start')
+    if (api === 'activation') test.useActivations()
     const pending = test.command()!.handler({ ...invocation(), signal: controller.signal })
     await vi.waitFor(() => expect(started).toHaveBeenCalledTimes(2))
     controller.abort()
@@ -398,12 +608,201 @@ describe('DSH command integration', () => {
     await vi.waitFor(() => expect(disposed).toHaveLength(2))
   })
 
-  it('unloads promptly while a question provider ignores cancellation', async () => {
+  it.each(['legacy', 'activation'] as const)('unloads promptly on %s while a question provider ignores cancellation', async (api) => {
     const test = harness(async () => new Promise(() => {}))
+    if (api === 'activation') test.useActivations()
     const pending = test.command()!.handler(invocation())
     await test.dispose()
     expect(await pending).toMatchObject({ kind: 'error', text: 'Council was canceled.' })
     expect(test.childRequests).toHaveLength(0)
+  })
+
+  it.each([undefined, 8000, 32768])('restores durable activation policy and never widens a cold child budget (%s)', async (requestedCap) => {
+    const first = harness()
+    first.useActivations()
+    expect(await first.command()!.handler(invocation())).toMatchObject({ kind: 'success' })
+    const original = first.children[2]!
+    const events = (original.session as unknown as { events: SessionEvent[] }).events
+    await first.dispose()
+    const restarted = harness()
+    const resumed = restarted.childAgent(String(original.id), String(existingAgent.id), structuredClone(events))
+    if (requestedCap !== undefined) resumed.options.maxTokens = requestedCap
+    await restarted.emitCreated(resumed)
+    expect(resumed.options.maxTokens).toBe(requestedCap === 8000 ? 8000 : 16384)
+    expect(restarted.restrictions).toEqual([{ allow: ['web_search', 'web_fetch'] }])
+    expect(restarted.personas[0]?.text).toBe(first.personas[2]?.text)
+    expect(restarted.guards[0]!({ name: 'shell' })).toBeDefined()
+    expect(restarted.guards[0]!({ name: 'subagent' })).toBeDefined()
+    expect(restarted.guards[0]!({ name: 'structured_output' })).toBeDefined()
+    expect(restarted.guards[0]!({ name: 'web_fetch' })).toBeUndefined()
+    expect(restarted.childRequests).toHaveLength(0)
+    await restarted.dispose()
+    expect(restarted.policyDisposals).toEqual([])
+    await restarted.disposeChildPolicy(resumed)
+    expect(restarted.policyDisposals).toEqual([original.id])
+  })
+
+  it('fails closed when an old child policy and the provider both lack a token budget', async () => {
+    const test = harness()
+    const message = createUserMessage({ content: [], source: { kind: 'dsh-council', childPolicy: {
+      version: 1, childId: 'legacy-cold', parentId: 'root', persona: 'Old Council persona',
+    } } })
+    const child = test.childAgent('legacy-cold', 'root', [{ type: 'agent/inbox/spliced', seq: 0, time: 0,
+      data: { target: 'next-step', start: 0, inserted: [message] } } as SessionEvent])
+    await expect(test.emitCreated(child)).rejects.toThrow('token budget is unavailable')
+    expect(test.childRequests).toHaveLength(0)
+    expect(test.guards[0]!({ name: 'shell' })).toBeDefined()
+    await test.disposeChildPolicy(child)
+    await test.dispose()
+  })
+
+  it.each([false, true])('keeps cold-resumed guards until their own scope closes during unload (managed=%s)', async (managed) => {
+    const first = harness()
+    first.useActivations()
+    await first.command()!.handler(invocation())
+    const original = first.children[0]!
+    const events = structuredClone((original.session as unknown as { events: SessionEvent[] }).events)
+    await first.dispose()
+    const test = harness()
+    const child = test.childAgent(String(original.id), String(existingAgent.id), events)
+    const idle = Promise.withResolvers<void>()
+    child.cancel = vi.fn()
+    child.whenIdle = () => idle.promise
+    const drain = vi.fn(async () => { await idle.promise })
+    if (managed) {
+      const get = test.ctx.get.bind(test.ctx)
+      test.ctx.get = ((key: string, strict?: boolean) => key === 'agents'
+        ? { get: () => first.childRequests[0]!.parent } : get(key, strict)) as Context['get']
+      Object.assign(test.ctx.subagents, { drainChildren: drain })
+    }
+    await test.emitCreated(child)
+    let unloaded = false
+    const unload = test.dispose().then(() => { unloaded = true })
+    await Promise.resolve()
+    expect(child.cancel).toHaveBeenCalledWith({ kind: 'disposed' })
+    expect(unloaded).toBe(false)
+    expect(test.policyDisposals).toEqual([])
+    expect(test.guards[0]!({ name: 'shell' })).toBeDefined()
+    if (managed) expect(drain).toHaveBeenCalledWith(first.childRequests[0]!.parent, [child.id])
+    // No new restored creation is admitted after teardown starts.
+    await expect(test.emitCreated(test.childAgent(String(child.id), String(existingAgent.id), events)))
+      .rejects.toThrow('plugin disposed')
+    idle.resolve()
+    await unload
+    // A successful drain can be a no-op; only the child's own scope proves it
+    // safe to release policy, even after the plugin's teardown has completed.
+    expect(test.policyDisposals).toEqual([])
+    expect(test.guards[0]!({ name: 'subagent' })).toBeDefined()
+    await test.disposeChildPolicy(child)
+    expect(test.policyDisposals).toEqual([child.id])
+  })
+
+  it('vetoes a restoring child if unload races its asynchronous prompt assembly', async () => {
+    const first = harness()
+    first.useActivations()
+    await first.command()!.handler(invocation())
+    const original = first.children[0]!
+    const events = structuredClone((original.session as unknown as { events: SessionEvent[] }).events)
+    await first.dispose()
+    const test = harness()
+    const child = test.childAgent(String(original.id), String(existingAgent.id), events)
+    const gate = Promise.withResolvers<void>()
+    const assemble = child.ctx.systemPrompt.assemble.bind(child.ctx.systemPrompt)
+    child.ctx.systemPrompt.assemble = async (...args) => { await gate.promise; return assemble(...args) }
+    const creating = test.emitCreated(child)
+    await test.dispose()
+    expect(test.policyDisposals).toEqual([])
+    const rejected = expect(creating).rejects.toThrow('plugin disposed')
+    gate.resolve()
+    await rejected
+    await test.disposeChildPolicy(child)
+  })
+
+  it('does not restrict unrelated agents or conflate concurrent parent starts', async () => {
+    const test = harness()
+    await test.emitCreated(test.childAgent('unrelated', 'root'))
+    expect(test.guards).toHaveLength(0)
+    test.useActivations()
+    const another = agentWithHistory()
+    Object.assign(another, { id: 'another-parent' })
+    Object.assign(another.session, { id: 'another-parent', header: { ...another.session.header, id: 'another-parent' } })
+    const results = await Promise.all([
+      test.command()!.handler(invocation()), test.command()!.handler(invocation('', another)),
+    ])
+    expect(results.every(result => result.kind === 'success')).toBe(true)
+    expect(test.childRequests).toHaveLength(8)
+    for (const child of test.children.slice(1)) {
+      const state = test.ctx.sessionProjections.stateOf(child.session, 'dsh-council:child-policy')
+      expect(state?.policy?.childId).toBe(child.id)
+      expect(state?.policy?.parentId).toBe(child.session.header.parentSession)
+    }
+    await test.dispose()
+    expect(test.policyDisposals).toHaveLength(8)
+  })
+
+  it('fails creation rather than running without a persona under a complete child preset', async () => {
+    const test = harness()
+    test.useActivations()
+    test.suppressPersona()
+    const result = await test.command()!.handler(invocation())
+    expect(result.kind).toBe('error')
+    expect(result.text).toContain('child preset suppresses the Council persona')
+    expect(test.activationSpecs).toHaveLength(2)
+    await test.dispose()
+  })
+
+  it.each(['legacy', 'activation'] as const)('joins late %s startup receipts on unload after command cancellation', async (api) => {
+    const test = harness()
+    const gate = Promise.withResolvers<void>()
+    const start = test.ctx.subagents.start.bind(test.ctx.subagents)
+    const pendingStart = vi.fn(async (...args: Parameters<typeof start>) => { await gate.promise; return start(...args) })
+    test.ctx.subagents.start = pendingStart
+    if (api === 'activation') test.useActivations()
+    const controller = new AbortController()
+    const pending = test.command()!.handler({ ...invocation(), signal: controller.signal })
+    await vi.waitFor(() => expect(pendingStart).toHaveBeenCalledTimes(2))
+    controller.abort()
+    expect(await pending).toMatchObject({ kind: 'error', text: 'Council was canceled.' })
+    let unloaded = false
+    const unload = test.dispose().then(() => { unloaded = true })
+    await Promise.resolve()
+    expect(unloaded).toBe(false)
+    gate.resolve()
+    await unload
+    expect(test.disposed).toHaveLength(2)
+    expect(test.policyDisposals).toHaveLength(2)
+  })
+
+  it.each(['legacy', 'activation'] as const)('keeps %s guards until delayed child disposal finishes on unload', async (api) => {
+    const test = harness()
+    const gate = Promise.withResolvers<void>()
+    const start = test.ctx.subagents.start.bind(test.ctx.subagents)
+    let disposing = 0
+    test.ctx.subagents.start = async (...args) => {
+      const run = await start(...args)
+      return { ...run, result: new Promise(() => {}), async dispose() {
+        disposing += 1
+        await gate.promise
+        await run.dispose()
+      } }
+    }
+    if (api === 'activation') test.useActivations()
+    const controller = new AbortController()
+    const pending = test.command()!.handler({ ...invocation(), signal: controller.signal })
+    await vi.waitFor(() => expect(test.childRequests).toHaveLength(2))
+    controller.abort()
+    expect(await pending).toMatchObject({ kind: 'error' })
+    await vi.waitFor(() => expect(disposing).toBe(2))
+    let unloaded = false
+    const unload = test.dispose().then(() => { unloaded = true })
+    await Promise.resolve()
+    expect(unloaded).toBe(false)
+    expect(test.policyDisposals).toHaveLength(0)
+    expect(test.guards.every(guard => guard({ name: 'shell' }) !== undefined)).toBe(true)
+    gate.resolve()
+    await unload
+    expect(test.disposed).toHaveLength(2)
+    expect(test.policyDisposals).toHaveLength(2)
   })
 
   it('keeps an in-progress run in its original language while later invocations use the new language', async () => {
@@ -419,5 +818,158 @@ describe('DSH command integration', () => {
     { runTimeoutMs: 1 },
   ])('rejects invalid configuration before registering the command: %o', (override) => {
     expect(() => harness(undefined, undefined, 'en', { ...config, ...override })).toThrow('dsh-council:')
+  })
+})
+
+
+describe('canonical terminal integration', () => {
+  function ownResults(parent: TestAgent) {
+    return parent.recordedEvents.filter(event => event.type === 'agent/inbox/spliced')
+      .flatMap(event => event.data?.inserted as ReturnType<typeof createUserMessage>[])
+      .filter(message => message.source.kind === 'dsh-council' && message.source.result !== undefined)
+  }
+  it('RUN-02/REC-01 replays an existing canonical terminal without injecting or rerunning children', async () => {
+    const test = harness()
+    const parent = agentWithHistory()
+    const first = await test.command()!.handler(invocation('', parent))
+    const eventCount = parent.recordedEvents.length
+    const replay = await test.command()!.handler(invocation('', parent))
+    expect(first.kind).toBe('success')
+    if (first.kind !== 'success') throw new Error('Expected successful canonical result')
+    expect(replay).toMatchObject({ kind: 'success', sourceEventSeq: first.sourceEventSeq })
+    expect(test.childRequests).toHaveLength(4)
+    expect(ownResults(parent)).toHaveLength(1)
+    expect(parent.recordedEvents).toHaveLength(eventCount)
+  })
+  it('RUN-02 cannot report successful completion when the canonical write fails', async () => {
+    const test = harness()
+    const parent = agentWithHistory()
+    const inject = parent.inject.bind(parent)
+    parent.inject = message => {
+      if (message.source.kind === 'dsh-council' && message.source.result !== undefined) throw new Error('TERMINAL_WRITE_FAILED')
+      return inject(message)
+    }
+    const result = await test.command()!.handler(invocation('', parent))
+    expect(result).toMatchObject({ kind: 'error', text: expect.stringContaining('TERMINAL_WRITE_FAILED') })
+    expect(ownResults(parent)).toHaveLength(0)
+    const successUi = parent.recordedEvents.filter(event => event.type === 'agent/inbox/spliced')
+      .flatMap(event => event.data?.inserted as ReturnType<typeof createUserMessage>[])
+      .some(message => message.source.kind === 'dsh-council' && message.source.ui?.status === 'success')
+    expect(successUi).toBe(false)
+  })
+  it('RUN-02 cancellation after the canonical append cannot create an opposite terminal', async () => {
+    const test = harness()
+    const controller = new AbortController()
+    const parent = agentWithHistory()
+    const inject = parent.inject.bind(parent)
+    parent.inject = message => {
+      const result = inject(message)
+      if (message.source.kind === 'dsh-council' && message.source.result !== undefined) controller.abort(new Error('LATE_CALLER_CANCEL'))
+      return result
+    }
+    const result = await test.command()!.handler({ ...invocation('', parent), signal: controller.signal })
+    expect(result.kind).toBe('success')
+    expect(ownResults(parent)).toHaveLength(1)
+    expect(ownResults(parent)[0]).toMatchObject({ source: { result: { status: 'success' } } })
+  })
+  it('RUN-02 a failed final UI publish does not turn a committed success into an error', async () => {
+    const test = harness()
+    const parent = agentWithHistory()
+    const inject = parent.inject.bind(parent)
+    parent.inject = message => {
+      if (message.source.kind === 'dsh-council' && message.source.ui?.status === 'success') throw new Error('UI_PUBLISH_FAILED')
+      return inject(message)
+    }
+    const result = await test.command()!.handler(invocation('', parent))
+    expect(result.kind).toBe('success')
+    expect(result).toHaveProperty('sourceEventSeq')
+    expect(ownResults(parent)).toHaveLength(1)
+  })
+  it('RET-02 only admits the question and compact ModelReturn, never the full audit or empty records', async () => {
+    const test = harness()
+    const parent = agentWithHistory()
+    await test.command()!.handler(invocation('', parent))
+    const messages = parent.recordedEvents.filter(event => event.type === 'agent/inbox/spliced')
+      .flatMap(event => event.data?.inserted as ReturnType<typeof createUserMessage>[])
+    const decision = await test.preStep()!({ agent: parent, messages }, async () => ({ kind: 'enter', messages, startsRequestSeries: true }))
+    expect(decision).toMatchObject({ kind: 'enter', startsRequestSeries: true })
+    expect(decision.messages).toHaveLength(2)
+    const text = decision.messages?.map(message => (message as ReturnType<typeof createUserMessage>).content.map(block => block.type === 'text' ? block.text : '').join('')).join('\n')
+    expect(text).toContain('Question')
+    expect(text).toContain('Final answer')
+    expect(text).not.toMatch(/p\/a|Anonymous Mapping|Aggregate Ranking|runRecord|childPolicy/)
+  })
+})
+
+
+describe('fail-closed child ownership and retention cancellation', () => {
+  it('SEC-01 quarantines tool execution synchronously before cold ownership awaits', async () => {
+    const first = harness()
+    first.useActivations()
+    await first.command()!.handler(invocation())
+    const original = first.children[0]!
+    const events = structuredClone((original.session as unknown as { events: SessionEvent[] }).events)
+    await first.dispose()
+    const restarted = harness()
+    const child = restarted.childAgent(String(original.id), 'root', events)
+    const restoring = restarted.emitCreated(child)
+    expect(restarted.guards).toHaveLength(1)
+    expect(restarted.guards[0]!({ name: 'web_search' })).toContain('authorization')
+    await restoring
+    expect(restarted.guards).toHaveLength(1)
+    expect(restarted.guards[0]!({ name: 'web_search' })).toBeUndefined()
+    expect(restarted.guards[0]!({ name: 'shell' })).toBeDefined()
+    await restarted.disposeChildPolicy(child)
+    await restarted.dispose()
+  })
+  it('SEC-03 rejects an owned child even after ALL its policy and child-binding markers disappear', async () => {
+    const first = harness()
+    first.useActivations()
+    expect((await first.command()!.handler(invocation())).kind).toBe('success')
+    const original = first.children[0]!
+    const background = createUserMessage({ content: [{ type: 'text', text: 'FROZEN_BACKGROUND_SENTINEL' }], source: { kind: 'user' } })
+    const events: SessionEvent[] = [{ type: 'user/message', seq: 0, time: 0, data: background, surfaceOp: 'append' } as SessionEvent]
+    await first.dispose()
+    const restarted = harness()
+    const child = restarted.childAgent(String(original.id), 'root', events)
+    await expect(restarted.emitCreated(child)).rejects.toThrow('policy is missing or conflicts with its parent manifest')
+    expect(restarted.childRequests).toHaveLength(0)
+    expect(restarted.guards.every(guard => guard({ name: 'web_search' }) !== undefined)).toBe(true)
+    await restarted.disposeChildPolicy(child)
+    await restarted.dispose()
+  })
+  it.each([true, false])('RUN-01 cancels retention without waiting for foreign parent work (pending=%s)', async pendingMarker => {
+    const test = harness()
+    const parent = agentWithHistory(true)
+    const controller = new AbortController()
+    const idle = Promise.withResolvers<void>()
+    let marker: ReturnType<typeof createUserMessage> | undefined
+    let scoped: PreStepListener | undefined
+    let releases = 0
+    const remove = vi.fn(() => pendingMarker)
+    Object.assign(parent, {
+      inbox: { remove },
+      followup(message: ReturnType<typeof createUserMessage>) { marker = message },
+      whenIdle: () => idle.promise,
+      ctx: { on(event: string, listener: PreStepListener) { if (event === 'agent/pre-step') scoped = listener; return () => { releases += 1 } } },
+    })
+    const running = test.command()!.handler({ ...invocation('', parent), signal: controller.signal })
+    await vi.waitFor(() => expect(marker).toBeDefined())
+    controller.abort(new Error('CANCEL_RETENTION'))
+    expect(await running).toMatchObject({ kind: 'error', text: expect.stringContaining('canceled') })
+    await test.dispose()
+    expect(remove).toHaveBeenCalledWith(marker!.id)
+    expect(test.childRequests).toHaveLength(0)
+    if (!pendingMarker) {
+      // remove=false can mean already claimed. The parent-owned veto survives
+      // plugin teardown until that exact late marker is rejected and drained.
+      expect(releases).toBe(0)
+      const next = vi.fn(async () => ({ kind: 'enter' as const, messages: [marker!] }))
+      expect(await scoped!({ agent: parent, messages: [marker!] }, next)).toEqual({ kind: 'reject' })
+      expect(next).not.toHaveBeenCalled()
+    }
+    idle.resolve()
+    await Promise.resolve()
+    expect(releases).toBe(1)
   })
 })

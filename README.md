@@ -70,13 +70,34 @@ Install [DeepSeek Harness (dsh)](https://www.deepseek.com/harness/) by following
 Install the prebuilt package from npm:
 
 ```sh
-npx --yes @deepseek-ai/dsh@latest plugin --profile web add @a1exsun/dsh-council@0.1.0
+npx --yes @deepseek-ai/dsh@latest plugin --profile web add @greenhats/dsh-council@0.1.3
 npx --yes @deepseek-ai/dsh@latest web
 ```
 
 <blockquote><p>Restart DSH Web if it is already running.</p></blockquote>
 
 No source checkout or compilation is required. See [Contributing](CONTRIBUTING.md) for development setup.
+
+For Desktop DSH, install the bundle into the profile used by the desktop app; a separate CLI `web` profile is not necessarily shared. This release adapts both the legacy `start()` interface and Desktop DSH `0.2.1-rc.5`'s `startActivation()` interface. See [release readiness](docs/release-readiness.md) for qualification results.
+
+Council requires fresh child context and explicit model/structured-output support. On the activation API it requires a managed local provider (the default `spawn`), reinstalls its persona and durable per-run tool policy before the first prompt and on cold continuation (no Web in chat-background mode; Web remains available in topic-only mode), and rejects presets that suppress the Council persona. Only reviewers and the arbiter receive `structured_output` during their original activation; shell, file, and delegation tools remain blocked.
+
+### Chat integration in 0.1.3
+
+Version 0.1.3 retains new sessions before model selection, records the real question, and renders a Council response in conversation order. Expand the execution panel to inspect participants' public reasoning/text; the final prose is separate from the collapsed audit. This uses the Desktop `0.2.1-rc.5` Client APIs; older clients retain a command-report fallback. The npm command above pins `0.1.3`; installing it does not restart the app or update other profiles automatically.
+
+After adding this Client half, fully quit and reopen Desktop DSH: refreshing the page alone does not invalidate the Host's cached package manifest. See [chat integration and acceptance checks](docs/chat-integration.md).
+
+### Context-integration MVP in 0.1.3
+
+By default, choose **current chat background / topic only / cancel** before the roster picker. Chat mode takes a consistent cut of the exact live parent and current Inbox. Select original-text sources, then review the **complete public material and every receiving route** in the native confirmation. Reselecting invalidates earlier consent. Assistant proposals remain unverified; tool evidence is opt-in. Prior Council history contributes only a reliably separated compact result. No model summarizes your history.
+
+- Chat mode denies Web, files, Shell and delegation. Attachments are reference-only/excluded names: no body reading or OCR.
+- Oversized material fails explicitly or offers topic-only; nothing is silently truncated. Every model needs a trustworthy context window from metadata or a verified exact-key override. Unknown windows never dispatch chat requests. Older Hosts lacking capture capabilities offer explicit topic-only/cancel; missing authoritative Inbox may offer explicitly approved surface-only history.
+- Only the compact ModelReturn enters the original chat: answer, decision changes, consensus/disagreements, necessary sources, anonymous coverage and limitations. Full mappings/rankings/raw process stay in audit details and separate children. No extra parent summarization request is made; the next ordinary follow-up admits the handoff.
+- Only consented packets persist. Reopening does not restore cleared pending input. Records and restricted cold children remain observable, but an interrupted whole Council run is not automatically resumed. Editing original text cannot recall copies already sent to providers or child sessions.
+
+Local engineering and isolated Host qualification are complete; npm publication does not install the bundle into your Desktop profile. Complete native-preview usability, real follow-up conversations, narrow layouts and themes still need authorized device acceptance. See the [implementation report](docs/context-integration-implementation-report.md).
 
 ## Usage
 
@@ -94,7 +115,7 @@ Enter this command in a DSH Web conversation:
 </td>
 <td width="65%" valign="top">
 <h3>Ask your question</h3>
-<p>Each participant starts with fresh context. Include the information it needs in your question.</p>
+<p>Each participant starts in a fresh independent session. First choose selected chat excerpts with a complete export preview, or use only the topic.</p>
 </td>
 </tr>
 </table>
@@ -110,11 +131,11 @@ Enter this command in a DSH Web conversation:
 <tr>
 <td width="33%" valign="top">
 <p><strong>Cost</strong></p>
-<p>4–17 model participants per run. Each may make multiple requests and use Web tools.</p>
+<p>4–17 model participants per run. Each may make multiple requests; only topic-only mode permits Web tools.</p>
 </td>
 <td width="33%" valign="top">
 <p><strong>Privacy</strong></p>
-<p>Your question and intermediate answers go to selected providers. See <a href="SECURITY.md">Security</a>.</p>
+<p>Your topic, consented selected chat excerpts, and intermediate artifacts go to selected providers. No chat body is exported before consent. See <a href="SECURITY.md">Security</a>.</p>
 </td>
 <td width="33%" valign="top">
 <p><strong>Accuracy</strong></p>
@@ -134,7 +155,7 @@ Enter this command in a DSH Web conversation:
 <details>
 <summary><strong>Defaults and overrides</strong></summary>
 
-The defaults work without additional configuration. To adjust limits, set `config` on the `dsh-council` entry in your DSH profile:
+The default offers chat-background selection; missing trusted windows or capture capability requires an explicit topic-only choice. To adjust limits, set `config` on the `dsh-council` entry in your DSH profile:
 
 ```yaml
 - id: dsh-council
@@ -145,9 +166,25 @@ The defaults work without additional configuration. To adjust limits, set `confi
     childTimeoutMs: 300000
     runTimeoutMs: 900000
     subagentProvider: spawn
+    contextMode: chat              # topic-only skips all history capture
+    contextCaptureAttempts: 3
+    contextCaptureTimeoutMs: 5000
+    contextPreparationTimeoutMs: 30000
+    contextMaxSources: 64
+    contextCandidateMaxBytes: 524288
+    contextPacketMaxBytes: 65536
+    contextMaxTokens: 4096
+    contextAnswerArtifactTokens: 2048
+    contextReviewArtifactTokens: 2048
+    contextArbiterOutputTokens: 4096
+    contextEnvelopeReserveTokens: 8192
+    contextSafetyMarginTokens: 2048
+    contextWindowOverrides: {}     # exact provider/model -> verified positive window
 ```
 
 Token limits apply per model request. Timeouts are in milliseconds; `runTimeoutMs` must be at least `childTimeoutMs`.
+
+Chat output caps are the smaller of the existing stage cap and artifact budget. UTF-8 bytes and heuristic token estimates are checked separately. Human waiting is excluded from preparation/deliberation deadlines; actual requests recheck system text, messages and tool schemas. TokenMeter is not a provider-exact tokenizer.
 
 </details>
 

@@ -1,0 +1,67 @@
+{
+  "preparedOn": "2026-11-03",
+  "recordScope": "Historical 0.1.2 prepublication qualification snapshot. Subsequent user-reported publication, Git commits, active-profile changes and local 0.1.3 UI work are outside these recorded check results.",
+  "package": "@greenhats/dsh-council@0.1.2",
+  "artifact": {
+    "file": "greenhats-dsh-council-0.1.2.tgz",
+    "format": "npm pack --ignore-scripts (after production build)",
+    "sizeBytes": 55196,
+    "unpackedSizeBytes": 188371,
+    "entryCount": 14,
+    "sha1": "4bda20fec137da4d665be29346daab783d79b5fa",
+    "integrity": "sha512-Ksh8qTDKguUkS1mzAVrdXVuhphjDkDX7z9H6yxiOgFLDrzemBQ/KFfX9GFdEqyKAWv2qF+sHWMi2dPbvuA3IFg==",
+    "identicalToAllFinalHostTestTarballs": true
+  },
+  "environment": {
+    "platform": "macOS",
+    "node": "24.21.0",
+    "pnpm": "11.7.0"
+  },
+  "checks": {
+    "typecheck": "passed",
+    "unitAndAdapterTests": { "status": "passed", "tests": 116, "files": 6 },
+    "coveragePercent": { "lines": 98.72, "branches": 92.5, "statements": 97.65, "functions": 99.42 },
+    "productionBuild": "passed",
+    "frozenLockfileOfflineInstall": "passed",
+    "peerDependencies": "passed",
+    "documentationLinks": "passed",
+    "scriptSyntax": "passed",
+    "gitDiffWhitespace": "passed",
+    "npmPublishDryRunOfExactArtifact": "passed_without_credentials",
+    "packageContents": "14 files; runtime, declarations, patch, license, bilingual documentation and assets; no tests, scripts, node_modules, coverage, or environment files"
+  },
+  "hostMatrix": [
+    {
+      "requested": "0.1.2-rc.1", "resolved": "0.1.2-rc.1", "api": "legacy", "status": "passed",
+      "councilModelRequests": 8, "deniedToolProbes": 8, "persistedResultReloads": 2, "coldContinuations": 0,
+      "locales": ["en", "zh"], "freshCandidateProfile": true, "reusedVersionCheckedRuntimeForFinalRun": true,
+      "vendorOverrides": {
+        "@deepseek-ai/cordis": "4.0.2", "@deepseek-ai/cordis-plugin-loader": "1.0.3",
+        "@deepseek-ai/cordis-plugin-include": "1.0.7", "@deepseek-ai/cordis-plugin-group": "1.0.2",
+        "@deepseek-ai/cordis-plugin-hmr": "1.0.17", "@deepseek-ai/cordis-plugin-timer": "1.1.4",
+        "@deepseek-ai/cosmokit": "1.8.3", "@deepseek-ai/schemastery": "3.18.2"
+      }
+    },
+    {
+      "requested": "0.2.1-rc.5", "resolved": "0.2.1-rc.5", "api": "activation", "status": "passed",
+      "councilModelRequests": 8, "deniedToolProbes": 10, "persistedResultReloads": 2, "coldContinuations": 2,
+      "locales": ["en", "zh"], "freshCandidateProfile": true, "reusedVersionCheckedRuntimeForFinalRun": true
+    },
+    {
+      "requested": "latest", "resolved": "0.2.1-rc.5", "api": "activation", "status": "passed",
+      "councilModelRequests": 8, "deniedToolProbes": 10, "persistedResultReloads": 2, "coldContinuations": 2,
+      "locales": ["en", "zh"], "freshCandidateProfile": true, "reusedVersionCheckedRuntimeForFinalRun": true,
+      "earlierFreshRuntimeInstallationAlsoPassed": true
+    }
+  ],
+  "qualificationLimits": {
+    "providers": "deterministic fixture adapters; no live model quality or paid API testing",
+    "legacyHost": "release-time Cordis vendor tuple only; upstream floating-vendor HMR mixture is not qualified",
+    "hostedCI": "configured but not run in this local task",
+    "node22": "CI matrix configured; not locally tested",
+    "activeDesktopProfile": "not modified or reinstalled",
+    "publication": "not performed",
+    "gitCommitTagPush": "not performed",
+    "supportDestination": "repository/homepage still point upstream; confirm intended fork support links before publishing"
+  }
+}

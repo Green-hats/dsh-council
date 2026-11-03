@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const media = JSON.parse(readFileSync(resolve(root, 'promo/hosting.json'), 'utf8'))
-for (const file of ['README.md', 'README.zh.md', 'CONTRIBUTING.md', 'SECURITY.md', 'docs/release-readiness.md', 'promo/README.md']) {
+for (const file of ['README.md', 'README.zh.md', 'CONTRIBUTING.md', 'SECURITY.md', 'docs/release-readiness.md', 'docs/chat-integration.md', 'docs/context-integration-implementation-report.md', 'promo/README.md']) {
   const path = resolve(root, file)
   const source = readFileSync(path, 'utf8')
   const withoutCode = source.replace(/```[\s\S]*?```/g, '')

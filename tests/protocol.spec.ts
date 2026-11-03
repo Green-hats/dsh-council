@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest'
+import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
+import { canonicalJson, createStageMaterial } from '../src/context-packet.js'
 import {
   aggregateRankings,
   arbiterPrompt,
+  chatArbiterSchema,
+  chatReviewerSchema,
+  chatStagePersona,
+  chatStagePrompt,
+  parseChatReviewerOutput,
   parseArbiterOutput,
   parseReviewerOutput,
   renderCouncilResult,
@@ -64,6 +71,42 @@ describe('structured outputs', () => {
     { consensus: [' '] }, { ranking: ['Answer A', 'missing'] },
   ])('rejects malformed reviewer evidence: %o', (change) => {
     expect(parseReviewerOutput({ ...validReview, ...change }, ['Answer A', 'Answer B'])).toBeUndefined()
+  })
+})
+
+describe('strict chat protocol', () => {
+  it('uses only Host-supported structured schema keywords while declaring strict new fields', () => {
+    for (const schema of [chatReviewerSchema(['Answer A', 'Answer B']), chatArbiterSchema(['S1']), chatArbiterSchema([])]) {
+      expect(() => assertObjectJsonSchema(schema)).not.toThrow()
+      expect(schema.additionalProperties).toBe(false)
+    }
+    expect(chatArbiterSchema(['S1']).required).toEqual(expect.arrayContaining(['decisionDeltas', 'citations']))
+    expect(chatArbiterSchema(['S1']).properties).not.toHaveProperty('coverage')
+    expect(chatArbiterSchema(['S1']).properties).not.toHaveProperty('runId')
+  })
+
+  it('enforces array/string/unknown-field ceilings in strict Host parsing', () => {
+    const ids = ['Answer A', 'Answer B']
+    expect(parseChatReviewerOutput(validReview, ids)).toEqual(validReview)
+    for (const change of [{ extra: 'unapproved' }, { consensus: Array.from({ length: 33 }, () => 'note') },
+      { blindSpots: ['a'.repeat(8_193)] }, { ranking: ['Answer A', 'Answer A'] },
+      { evaluations: [{ answerId: 'Answer A', strengths: [], weaknesses: [], extra: true }] }]) {
+      expect(parseChatReviewerOutput({ ...validReview, ...change }, ids)).toBeUndefined()
+    }
+  })
+
+  it.each(['en', 'zh'] as const)('keeps the same complete payload and forbids Web in the %s chat persona', locale => {
+    const material = createStageMaterial({ stage: 'answer', payload: { packet: { version: 1,
+      topicOriginal: '  original topic\n', sources: [{ alias: 'S1', kind: 'assistant-proposal', text: 'unverified code\n    keep spaces', epistemic: 'assistant-unverified' }],
+      omissions: [], attachments: [{ name: 'reference.txt', disposition: 'reference-only' }] } } })
+    const copy = localeCopies[locale]
+    expect(chatStagePrompt(material, copy)).toContain(canonicalJson(material.payload))
+    for (const stage of ['answer', 'review', 'arbiter'] as const) {
+      const persona = chatStagePersona(stage, copy)
+      expect(persona).toContain(locale === 'en' ? 'Do not browse' : '不得联网')
+      expect(persona).toContain(locale === 'en' ? 'untrusted data' : '不可信的数据')
+      expect(persona).not.toBe(stage === 'answer' ? copy.answerPersona : stage === 'review' ? copy.reviewPersona : copy.arbiterPersona)
+    }
   })
 })
 

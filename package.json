@@ -1,15 +1,15 @@
 {
-  "name": "@a1exsun/dsh-council",
-  "version": "0.1.0",
+  "name": "@greenhats/dsh-council",
+  "version": "0.1.3",
   "description": "Multi-model council deliberation for DeepSeek Harness",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/a1exsun/dsh-council.git"
+    "url": "git+https://github.com/Green-hats/dsh-council.git"
   },
-  "homepage": "https://github.com/a1exsun/dsh-council#readme",
+  "homepage": "https://github.com/Green-hats/dsh-council#readme",
   "bugs": {
-    "url": "https://github.com/a1exsun/dsh-council/issues"
+    "url": "https://github.com/Green-hats/dsh-council/issues"
   },
   "publishConfig": {
     "access": "public",
@@ -31,7 +31,10 @@
       "default": "./lib/index.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "lib/",
@@ -42,8 +45,13 @@
     "CONTRIBUTING.md",
     "SECURITY.md",
     "docs/release-readiness.md",
+    "docs/chat-integration.md",
+    "docs/context-integration-implementation-report.md",
     "docs/assets/codebestie-banner.svg",
-    "docs/assets/codebestie-banner.zh.svg"
+    "docs/assets/codebestie-banner.zh.svg",
+    "client.js",
+    "locale/",
+    "icon.svg"
   ],
   "scripts": {
     "build": "tsdown",
@@ -56,21 +64,34 @@
     "test:host": "pnpm build && node scripts/test-host.mjs"
   },
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.1.2-rc.1 <0.2.0 || >=0.2.1-rc.5 <0.3.0"
   },
   "packageManager": "pnpm@11.7.0",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "3.18.2"
+    "@deepseek-ai/schemastery": "3.18.2",
+    "zod": "^4.3.6"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.2",
-    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1"
+    "@deepseek-ai/cordis": ">=4.0.2 <5",
+    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.2.0 || >=0.2.1-rc.5 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.2.0 || >=0.2.1-rc.5 <0.3.0",
+    "@deepseek-ai/dsh-session": ">=0.1.2-rc.1 <0.2.0 || >=0.2.1-rc.5 <0.3.0",
+    "@deepseek-ai/dsh-session-projection": ">=0.1.2-rc.1 <0.2.0 || >=0.2.1-rc.5 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0 || >=0.2.1-rc.5 <0.3.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.2",
@@ -91,7 +112,11 @@
     "@deepseek-ai/dsh-user-approval": "0.1.2-rc.1",
     "@deepseek-ai/dsh-user-questions": "0.1.2-rc.1",
     "@types/node": "^22.20.0",
+    "@types/react": "18.3.27",
+    "@types/react-test-renderer": "18.3.1",
     "@vitest/coverage-v8": "4.1.11",
+    "react": "18.3.1",
+    "react-test-renderer": "18.3.1",
     "tsdown": "^0.22.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
